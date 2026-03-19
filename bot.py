@@ -8,80 +8,20 @@ import os
 import threading
 from datetime import datetime
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from alpaca_trade_api.rest import REST, TimeFrame
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
-    filename="trades.log",
     level=logging.INFO,
     format="%(asctime)s | %(message)s"
 )
 
 # ══════════════════════════════════════════════════════════════
-#  SETTINGS
+#  SHARED SETTINGS
 # ══════════════════════════════════════════════════════════════
-
-SYMBOLS         = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-TIMEFRAME       = "1h"
-HTF_TIMEFRAME   = "4h"
-FAST_EMA        = 5
-SLOW_EMA        = 50
-RSI_PERIOD      = 14
-RSI_OVERBOUGHT  = 70
-RSI_OVERSOLD    = 30
-STOP_LOSS_PCT   = 0.02
-TAKE_PROFIT_PCT = 0.04
-PAPER_BALANCE   = 10000.0
-RISK_PER_TRADE  = 0.02
-CHECK_INTERVAL  = 60 * 60
 
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
-
-# ══════════════════════════════════════════════════════════════
-#  PAPER TRADING STATE
-# ══════════════════════════════════════════════════════════════
-
-paper = {
-    symbol: {
-        "balance":       PAPER_BALANCE / len(SYMBOLS),
-        "coin_held":     0.0,
-        "in_trade":      False,
-        "entry_price":   0.0,
-        "highest_price": 0.0,
-        "total_trades":  0,
-        "wins":          0,
-        "losses":        0,
-    }
-    for symbol in SYMBOLS
-}
-
-# ══════════════════════════════════════════════════════════════
-#  EXCHANGE
-# ══════════════════════════════════════════════════════════════
-
-exchange = ccxt.binanceus()
-
-# ══════════════════════════════════════════════════════════════
-#  HEALTH CHECK SERVER — keeps Railway alive
-# ══════════════════════════════════════════════════════════════
-
-class HealthHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        self.send_response(200)
-        self.end_headers()
-        self.wfile.write(b"Bot is running")
-    def log_message(self, format, *args):
-        pass  # suppress noisy server logs
-
-def start_health_server():
-    port = int(os.getenv("PORT", 8080))
-    server = HTTPServer(("0.0.0.0", port), HealthHandler)
-    print(f"Health server running on port {port}")
-    server.serve_forever()
-
-# ══════════════════════════════════════════════════════════════
-#  TELEGRAM
-# ══════════════════════════════════════════════════════════════
 
 def send_telegram(msg):
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
@@ -97,15 +37,60 @@ def send_telegram(msg):
         logging.error(f"Telegram error: {e}")
 
 # ══════════════════════════════════════════════════════════════
-#  DATA & INDICATORS
+#  HEALTH CHECK SERVER — keeps Railway alive
 # ══════════════════════════════════════════════════════════════
 
-def fetch_candles(symbol, timeframe, limit=100):
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bots are running")
+    def log_message(self, format, *args):
+        pass
+
+def start_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server running on port {port}")
+    server.serve_forever()
+
+# ══════════════════════════════════════════════════════════════
+#  CRYPTO BOT — BTC, ETH, SOL via Binance US
+# ══════════════════════════════════════════════════════════════
+
+CRYPTO_SYMBOLS      = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+CRYPTO_TIMEFRAME    = "1h"
+CRYPTO_HTF          = "4h"
+FAST_EMA            = 5
+SLOW_EMA            = 50
+RSI_PERIOD          = 14
+RSI_OVERBOUGHT      = 70
+RSI_OVERSOLD        = 30
+STOP_LOSS_PCT       = 0.02
+TAKE_PROFIT_PCT     = 0.04
+CRYPTO_BALANCE      = 10000.0
+RISK_PER_TRADE      = 0.02
+CRYPTO_INTERVAL     = 60 * 60
+
+exchange = ccxt.binanceus()
+
+crypto_paper = {
+    symbol: {
+        "balance":       CRYPTO_BALANCE / len(CRYPTO_SYMBOLS),
+        "coin_held":     0.0,
+        "in_trade":      False,
+        "entry_price":   0.0,
+        "highest_price": 0.0,
+        "total_trades":  0,
+        "wins":          0,
+        "losses":        0,
+    }
+    for symbol in CRYPTO_SYMBOLS
+}
+
+def fetch_crypto_candles(symbol, timeframe, limit=100):
     bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
-    df = pd.DataFrame(
-        bars,
-        columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
+    df = pd.DataFrame(bars, columns=["timestamp","open","high","low","close","volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
     df.set_index("timestamp", inplace=True)
     return df
@@ -117,229 +102,312 @@ def add_indicators(df):
     df["vol_avg"]  = df["volume"].rolling(window=20).mean()
     return df
 
-def get_htf_trend(symbol):
+def get_htf_trend_crypto(symbol):
     try:
-        df   = fetch_candles(symbol, HTF_TIMEFRAME, limit=60)
+        df   = fetch_crypto_candles(symbol, CRYPTO_HTF, limit=60)
         df   = add_indicators(df)
         last = df.iloc[-1]
-        if last["ema_fast"] > last["ema_slow"]:
-            return "UP"
-        elif last["ema_fast"] < last["ema_slow"]:
-            return "DOWN"
+        if last["ema_fast"] > last["ema_slow"]:   return "UP"
+        elif last["ema_fast"] < last["ema_slow"]: return "DOWN"
         return "NEUTRAL"
     except Exception as e:
-        logging.error(f"HTF trend error ({symbol}): {e}")
+        logging.error(f"Crypto HTF error ({symbol}): {e}")
         return "NEUTRAL"
 
 def get_signal(df):
     prev = df.iloc[-2]
     last = df.iloc[-1]
-
     buy = (
         prev["ema_fast"] < prev["ema_slow"] and
         last["ema_fast"] > last["ema_slow"] and
         last["rsi"]      < RSI_OVERBOUGHT   and
         last["volume"]   > last["vol_avg"] * 0.8
     )
-
     sell = (
         prev["ema_fast"] > prev["ema_slow"] and
         last["ema_fast"] < last["ema_slow"] and
         last["rsi"]      > RSI_OVERSOLD
     )
-
     if buy:  return "BUY",  last["close"], last["rsi"]
     if sell: return "SELL", last["close"], last["rsi"]
     return "HOLD", last["close"], last["rsi"]
 
-# ══════════════════════════════════════════════════════════════
-#  PAPER TRADING EXECUTION
-# ══════════════════════════════════════════════════════════════
-
-def paper_buy(symbol, price):
-    p = paper[symbol]
-    if p["in_trade"]:
-        return
-
+def crypto_buy(symbol, price):
+    p = crypto_paper[symbol]
+    if p["in_trade"]: return
     spend    = p["balance"] * RISK_PER_TRADE
     coin_qty = spend / price
-
-    if spend < 1.0:
-        return
-
-    p["balance"]        -= spend
-    p["coin_held"]       = coin_qty
-    p["in_trade"]        = True
-    p["entry_price"]     = price
-    p["highest_price"]   = price
-
+    if spend < 1.0: return
+    p["balance"] -= spend
+    p["coin_held"] = coin_qty
+    p["in_trade"] = True
+    p["entry_price"] = price
+    p["highest_price"] = price
     coin = symbol.split("/")[0]
-    sl   = price * (1 - STOP_LOSS_PCT)
-    tp   = price * (1 + TAKE_PROFIT_PCT)
-
-    msg = (
-        f"🟢 <b>BUY {coin}</b>\n"
-        f"Price:   ${price:,.2f}\n"
-        f"Spent:   ${spend:.2f}\n"
-        f"Amount:  {coin_qty:.6f} {coin}\n"
-        f"Balance: ${p['balance']:,.2f}\n"
-        f"SL: ${sl:,.2f}  |  TP: ${tp:,.2f}"
-    )
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] "
-          f"{msg.replace('<b>','').replace('</b>','')}")
-    logging.info(msg.replace("<b>", "").replace("</b>", ""))
+    msg = (f"🟢 <b>BUY {coin}</b>\n"
+           f"Price:   ${price:,.2f}\n"
+           f"Spent:   ${spend:.2f}\n"
+           f"Amount:  {coin_qty:.6f} {coin}\n"
+           f"Balance: ${p['balance']:,.2f}\n"
+           f"SL: ${price*(1-STOP_LOSS_PCT):,.2f}  |  TP: ${price*(1+TAKE_PROFIT_PCT):,.2f}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>','').replace('</b>','')}")
     send_telegram(msg)
 
-def paper_sell(symbol, price, reason="Signal"):
-    p = paper[symbol]
-    if not p["in_trade"]:
-        return
-
+def crypto_sell(symbol, price, reason="Signal"):
+    p = crypto_paper[symbol]
+    if not p["in_trade"]: return
     proceeds = p["coin_held"] * price
     pnl      = proceeds - (p["coin_held"] * p["entry_price"])
-
-    p["balance"]      += proceeds
+    p["balance"] += proceeds
     p["total_trades"] += 1
-    p["coin_held"]     = 0.0
-    p["in_trade"]      = False
+    p["coin_held"] = 0.0
+    p["in_trade"] = False
     p["highest_price"] = 0.0
-
     if pnl >= 0:
-        p["wins"] += 1
-        emoji  = "✅"
-        result = f"WIN  +${pnl:.2f}"
+        p["wins"] += 1; emoji = "✅"; result = f"WIN  +${pnl:.2f}"
     else:
-        p["losses"] += 1
-        emoji  = "❌"
-        result = f"LOSS -${abs(pnl):.2f}"
-
-    win_rate = (
-        p["wins"] / p["total_trades"] * 100
-        if p["total_trades"] > 0 else 0
-    )
+        p["losses"] += 1; emoji = "❌"; result = f"LOSS -${abs(pnl):.2f}"
+    win_rate = (p["wins"] / p["total_trades"] * 100) if p["total_trades"] > 0 else 0
     coin = symbol.split("/")[0]
+    msg = (f"{emoji} <b>SELL {coin}</b>  ({reason})\n"
+           f"Price:    ${price:,.2f}\n"
+           f"Result:   {result}\n"
+           f"Balance:  ${p['balance']:,.2f}\n"
+           f"Win rate: {win_rate:.1f}% ({p['wins']}W/{p['losses']}L)")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>','').replace('</b>','')}")
+    send_telegram(msg)
 
-    msg = (
-        f"{emoji} <b>SELL {coin}</b>  ({reason})\n"
-        f"Price:    ${price:,.2f}\n"
-        f"Result:   {result}\n"
-        f"Balance:  ${p['balance']:,.2f}\n"
-        f"Win rate: {win_rate:.1f}%  "
-        f"({p['wins']}W / {p['losses']}L)"
-    )
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] "
-          f"{msg.replace('<b>','').replace('</b>','')}")
-    logging.info(msg.replace("<b>", "").replace("</b>", ""))
+def check_crypto_exits(symbol, price):
+    p = crypto_paper[symbol]
+    if not p["in_trade"]: return
+    if price > p["highest_price"]: p["highest_price"] = price
+    if price <= p["highest_price"] * (1 - STOP_LOSS_PCT):
+        crypto_sell(symbol, price, reason="Trailing stop")
+    elif price >= p["entry_price"] * (1 + TAKE_PROFIT_PCT):
+        crypto_sell(symbol, price, reason="Take profit")
+
+def run_crypto():
+    coin_names = ", ".join(s.split("/")[0] for s in CRYPTO_SYMBOLS)
+    msg = (f"🤖 <b>Crypto bot started</b>\n"
+           f"Coins: {coin_names}\n"
+           f"EMA: {FAST_EMA}/{SLOW_EMA} | SL: {STOP_LOSS_PCT*100:.0f}% | TP: {TAKE_PROFIT_PCT*100:.0f}%\n"
+           f"Balance: ${CRYPTO_BALANCE:,.2f} (paper)")
+    print("=" * 58)
+    print(msg.replace("<b>","").replace("</b>",""))
+    print("=" * 58)
+    send_telegram(msg)
+
+    while True:
+        try:
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{now}] Checking crypto...")
+            for symbol in CRYPTO_SYMBOLS:
+                coin = symbol.split("/")[0]
+                try:
+                    df_now = fetch_crypto_candles(symbol, CRYPTO_TIMEFRAME, limit=5)
+                    check_crypto_exits(symbol, df_now["close"].iloc[-1])
+                    htf    = get_htf_trend_crypto(symbol)
+                    df     = fetch_crypto_candles(symbol, CRYPTO_TIMEFRAME, limit=100)
+                    df     = add_indicators(df)
+                    signal, price, rsi = get_signal(df)
+                    status = "IN TRADE" if crypto_paper[symbol]["in_trade"] else "watching"
+                    print(f"  {coin:<4} | {signal:<4} | 4h: {htf:<7} | RSI: {rsi:>5.1f} | ${price:>10,.2f} | {status}")
+                    if signal == "BUY":
+                        if htf == "UP": crypto_buy(symbol, price)
+                        else: print(f"        BUY blocked — 4h: {htf}")
+                    elif signal == "SELL":
+                        crypto_sell(symbol, price)
+                    time.sleep(2)
+                except Exception as e:
+                    print(f"  {coin} error: {e}")
+        except Exception as e:
+            print(f"Crypto loop error: {e}")
+        time.sleep(CRYPTO_INTERVAL)
+
+# ══════════════════════════════════════════════════════════════
+#  STOCKS BOT — VOO, QQQ, SPY via Alpaca
+# ══════════════════════════════════════════════════════════════
+
+STOCK_SYMBOLS    = ["VOO", "QQQ", "SPY"]
+STOCK_FAST_EMA   = 10
+STOCK_SLOW_EMA   = 50
+STOCK_BALANCE    = 10000.0
+STOCK_INTERVAL   = 60 * 15
+
+ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
+ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
+ALPACA_BASE_URL   = "https://paper-api.alpaca.markets"
+
+stock_paper = {
+    symbol: {
+        "balance":       STOCK_BALANCE / len(STOCK_SYMBOLS),
+        "shares_held":   0.0,
+        "in_trade":      False,
+        "entry_price":   0.0,
+        "highest_price": 0.0,
+        "total_trades":  0,
+        "wins":          0,
+        "losses":        0,
+    }
+    for symbol in STOCK_SYMBOLS
+}
+
+def run_stocks():
+    if not ALPACA_API_KEY or not ALPACA_SECRET_KEY:
+        print("Stocks bot: No Alpaca keys found — skipping stocks bot")
+        return
+
+    try:
+        alpaca = REST(ALPACA_API_KEY, ALPACA_SECRET_KEY, ALPACA_BASE_URL)
+    except Exception as e:
+        print(f"Stocks bot: Alpaca connection failed — {e}")
+        return
+
+    msg = (f"📈 <b>Stocks bot started</b>\n"
+           f"Stocks: {', '.join(STOCK_SYMBOLS)}\n"
+           f"EMA: {STOCK_FAST_EMA}/{STOCK_SLOW_EMA} | SL: {STOP_LOSS_PCT*100:.0f}% | TP: {TAKE_PROFIT_PCT*100:.0f}%\n"
+           f"Balance: ${STOCK_BALANCE:,.2f} (paper)\n"
+           f"Hours: Mon-Fri 9:30am-4pm ET only")
+    print("=" * 58)
+    print(msg.replace("<b>","").replace("</b>",""))
+    print("=" * 58)
+    send_telegram(msg)
+
+    while True:
+        try:
+            clock = alpaca.get_clock()
+            if not clock.is_open:
+                now  = pd.Timestamp(clock.timestamp)
+                nxt  = pd.Timestamp(clock.next_open)
+                mins = int((nxt - now).total_seconds() / 60)
+                print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — opens in ~{mins} min")
+                time.sleep(min(60 * 15, mins * 60))
+                continue
+
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            print(f"\n[{now}] Market open — checking stocks...")
+
+            for symbol in STOCK_SYMBOLS:
+                try:
+                    # Get current price
+                    bars_now = alpaca.get_bars(symbol, TimeFrame.Minute, limit=5).df
+                    current_price = bars_now["close"].iloc[-1]
+
+                    # Check exits
+                    p = stock_paper[symbol]
+                    if p["in_trade"]:
+                        if current_price > p["highest_price"]:
+                            p["highest_price"] = current_price
+                        if current_price <= p["highest_price"] * (1 - STOP_LOSS_PCT):
+                            stock_sell(symbol, current_price, alpaca, reason="Trailing stop")
+                        elif current_price >= p["entry_price"] * (1 + TAKE_PROFIT_PCT):
+                            stock_sell(symbol, current_price, alpaca, reason="Take profit")
+
+                    # Get daily trend
+                    bars_day = alpaca.get_bars(symbol, TimeFrame.Day, limit=60).df
+                    bars_day["ema_fast"] = ta.trend.ema_indicator(bars_day["close"], window=STOCK_FAST_EMA)
+                    bars_day["ema_slow"] = ta.trend.ema_indicator(bars_day["close"], window=STOCK_SLOW_EMA)
+                    last_day = bars_day.iloc[-1]
+                    htf = "UP" if last_day["ema_fast"] > last_day["ema_slow"] else "DOWN"
+
+                    # Get hourly signal
+                    bars_hr = alpaca.get_bars(symbol, TimeFrame.Hour, limit=100).df
+                    bars_hr["ema_fast"] = ta.trend.ema_indicator(bars_hr["close"], window=STOCK_FAST_EMA)
+                    bars_hr["ema_slow"] = ta.trend.ema_indicator(bars_hr["close"], window=STOCK_SLOW_EMA)
+                    bars_hr["rsi"]      = ta.momentum.rsi(bars_hr["close"], window=RSI_PERIOD)
+                    bars_hr["vol_avg"]  = bars_hr["volume"].rolling(window=20).mean()
+
+                    prev = bars_hr.iloc[-2]
+                    last = bars_hr.iloc[-1]
+
+                    buy = (prev["ema_fast"] < prev["ema_slow"] and
+                           last["ema_fast"] > last["ema_slow"] and
+                           last["rsi"] < RSI_OVERBOUGHT)
+                    sell = (prev["ema_fast"] > prev["ema_slow"] and
+                            last["ema_fast"] < last["ema_slow"] and
+                            last["rsi"] > RSI_OVERSOLD)
+
+                    signal = "BUY" if buy else "SELL" if sell else "HOLD"
+                    price  = last["close"]
+                    rsi    = last["rsi"]
+                    status = "IN TRADE" if p["in_trade"] else "watching"
+
+                    print(f"  {symbol:<4} | {signal:<4} | Daily: {htf:<7} | RSI: {rsi:>5.1f} | ${price:>8,.2f} | {status}")
+
+                    if signal == "BUY":
+                        if htf == "UP": stock_buy(symbol, price, alpaca)
+                        else: print(f"        BUY blocked — daily: {htf}")
+                    elif signal == "SELL":
+                        stock_sell(symbol, price, alpaca)
+
+                    time.sleep(2)
+
+                except Exception as e:
+                    print(f"  {symbol} error: {e}")
+
+        except Exception as e:
+            print(f"Stocks loop error: {e}")
+
+        time.sleep(STOCK_INTERVAL)
+
+def stock_buy(symbol, price, alpaca):
+    p = stock_paper[symbol]
+    if p["in_trade"]: return
+    spend  = p["balance"] * RISK_PER_TRADE
+    shares = spend / price
+    if spend < 1.0: return
+    p["balance"] -= spend
+    p["shares_held"] = shares
+    p["in_trade"] = True
+    p["entry_price"] = price
+    p["highest_price"] = price
+    msg = (f"🟢 <b>BUY {symbol}</b>\n"
+           f"Price:   ${price:,.2f}\n"
+           f"Spent:   ${spend:.2f}\n"
+           f"Shares:  {shares:.4f}\n"
+           f"Balance: ${p['balance']:,.2f}\n"
+           f"SL: ${price*(1-STOP_LOSS_PCT):,.2f}  |  TP: ${price*(1+TAKE_PROFIT_PCT):,.2f}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>','').replace('</b>','')}")
+    send_telegram(msg)
+
+def stock_sell(symbol, price, alpaca, reason="Signal"):
+    p = stock_paper[symbol]
+    if not p["in_trade"]: return
+    proceeds = p["shares_held"] * price
+    pnl      = proceeds - (p["shares_held"] * p["entry_price"])
+    p["balance"] += proceeds
+    p["total_trades"] += 1
+    p["shares_held"] = 0.0
+    p["in_trade"] = False
+    p["highest_price"] = 0.0
+    if pnl >= 0:
+        p["wins"] += 1; emoji = "✅"; result = f"WIN  +${pnl:.2f}"
+    else:
+        p["losses"] += 1; emoji = "❌"; result = f"LOSS -${abs(pnl):.2f}"
+    win_rate = (p["wins"] / p["total_trades"] * 100) if p["total_trades"] > 0 else 0
+    msg = (f"{emoji} <b>SELL {symbol}</b>  ({reason})\n"
+           f"Price:    ${price:,.2f}\n"
+           f"Result:   {result}\n"
+           f"Balance:  ${p['balance']:,.2f}\n"
+           f"Win rate: {win_rate:.1f}% ({p['wins']}W/{p['losses']}L)")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>','').replace('</b>','')}")
     send_telegram(msg)
 
 # ══════════════════════════════════════════════════════════════
-#  STOP-LOSS / TAKE-PROFIT CHECK
+#  MAIN — run everything in threads
 # ══════════════════════════════════════════════════════════════
-
-def check_exit_conditions(symbol, price):
-    p = paper[symbol]
-    if not p["in_trade"]:
-        return
-
-    if price > p["highest_price"]:
-        p["highest_price"] = price
-
-    trail_stop  = p["highest_price"] * (1 - STOP_LOSS_PCT)
-    take_profit = p["entry_price"]   * (1 + TAKE_PROFIT_PCT)
-
-    if price <= trail_stop:
-        paper_sell(symbol, price, reason="Trailing stop")
-    elif price >= take_profit:
-        paper_sell(symbol, price, reason="Take profit")
-
-# ══════════════════════════════════════════════════════════════
-#  STATUS PRINT
-# ══════════════════════════════════════════════════════════════
-
-def print_portfolio_summary():
-    print("\n" + "─" * 58)
-    total = 0
-    for symbol in SYMBOLS:
-        p    = paper[symbol]
-        coin = symbol.split("/")[0]
-        status = "IN TRADE" if p["in_trade"] else "watching"
-        total += p["balance"]
-        print(
-            f"  {coin:<4} | {status:<10} | "
-            f"Balance: ${p['balance']:>9,.2f} | "
-            f"Trades: {p['total_trades']} | "
-            f"W/L: {p['wins']}/{p['losses']}"
-        )
-    print(f"  {'TOTAL':<4} | {'':10} | Balance: ${total:>9,.2f}")
-    print("─" * 58)
-
-# ══════════════════════════════════════════════════════════════
-#  MAIN LOOP
-# ══════════════════════════════════════════════════════════════
-
-def run():
-    coin_names = ", ".join(s.split("/")[0] for s in SYMBOLS)
-
-    startup_msg = (
-        f"🤖 <b>Bot started</b>\n"
-        f"Coins:     {coin_names}\n"
-        f"Timeframe: {TIMEFRAME}  |  HTF: {HTF_TIMEFRAME}\n"
-        f"EMA:       {FAST_EMA}/{SLOW_EMA}  |  RSI: {RSI_PERIOD}\n"
-        f"SL: {STOP_LOSS_PCT*100:.0f}%  |  TP: {TAKE_PROFIT_PCT*100:.0f}%\n"
-        f"Balance:   ${PAPER_BALANCE:,.2f}  (paper mode)"
-    )
-
-    print("=" * 58)
-    print(startup_msg.replace("<b>", "").replace("</b>", ""))
-    print("=" * 58)
-    send_telegram(startup_msg)
-
-    while True:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"\n[{now}] Checking {len(SYMBOLS)} coins...")
-
-        for symbol in SYMBOLS:
-            coin = symbol.split("/")[0]
-            try:
-                df_now        = fetch_candles(symbol, TIMEFRAME, limit=5)
-                current_price = df_now["close"].iloc[-1]
-                check_exit_conditions(symbol, current_price)
-
-                htf = get_htf_trend(symbol)
-
-                df             = fetch_candles(symbol, TIMEFRAME, limit=100)
-                df             = add_indicators(df)
-                signal, price, rsi = get_signal(df)
-
-                status = "IN TRADE" if paper[symbol]["in_trade"] else "watching"
-                print(
-                    f"  {coin:<4} | {signal:<4} | "
-                    f"4h: {htf:<7} | "
-                    f"RSI: {rsi:>5.1f} | "
-                    f"${price:>10,.2f} | {status}"
-                )
-
-                if signal == "BUY":
-                    if htf == "UP":
-                        paper_buy(symbol, price)
-                    else:
-                        print(f"        BUY blocked — 4h trend is {htf}")
-                elif signal == "SELL":
-                    paper_sell(symbol, price)
-
-                time.sleep(2)
-
-            except Exception as e:
-                print(f"  {coin} error: {e}")
-                logging.error(f"{coin} error: {e}")
-
-        print_portfolio_summary()
-        time.sleep(CHECK_INTERVAL)
-
 
 if __name__ == "__main__":
-    # Start health check server in background thread — keeps Railway alive
-    thread = threading.Thread(target=start_health_server, daemon=True)
-    thread.start()
-    # Start the bot
-    run()
+    # Health server — keeps Railway alive
+    threading.Thread(target=start_health_server, daemon=True).start()
+
+    # Crypto bot thread
+    threading.Thread(target=run_crypto, daemon=True).start()
+
+    # Stocks bot thread
+    threading.Thread(target=run_stocks, daemon=True).start()
+
+    # Keep main thread alive forever
+    print("All bots running. Press Ctrl+C to stop.")
+    while True:
+        time.sleep(60)
