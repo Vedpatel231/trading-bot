@@ -361,14 +361,14 @@ def run_stocks():
                             stock_sell(symbol, current_price, alpaca, reason="Take profit")
 
                     # Daily trend
-                    bars_day = alpaca.get_bars(symbol, TimeFrame.Day, limit=100).df
+                    bars_day = alpaca.get_bars(symbol, TimeFrame.Day, limit=200).df
                     bars_day["ema_fast"] = ta.trend.ema_indicator(bars_day["close"], window=STOCK_FAST_EMA)
                     bars_day["ema_slow"] = ta.trend.ema_indicator(bars_day["close"], window=STOCK_SLOW_EMA)
                     last_day = bars_day.iloc[-1]
                     htf = "UP" if last_day["ema_fast"] > last_day["ema_slow"] else "DOWN"
 
                     # Hourly signal
-                    bars_hr = alpaca.get_bars(symbol, TimeFrame.Hour, limit=200).df
+                    bars_hr = alpaca.get_bars(symbol, TimeFrame.Hour, limit=500).df
                     bars_hr["ema_fast"] = ta.trend.ema_indicator(bars_hr["close"], window=STOCK_FAST_EMA)
                     bars_hr["ema_slow"] = ta.trend.ema_indicator(bars_hr["close"], window=STOCK_SLOW_EMA)
                     bars_hr["rsi"]      = ta.momentum.rsi(bars_hr["close"], window=RSI_PERIOD)
@@ -383,6 +383,12 @@ def run_stocks():
                     sell = (prev["ema_fast"] > prev["ema_slow"] and
                             last["ema_fast"] < last["ema_slow"] and
                             last["rsi"] > RSI_OVERSOLD)
+
+                    # Skip if RSI is nan (not enough data yet)
+                    if pd.isna(last["rsi"]):
+                        print(f"  {symbol:<4} | waiting for enough data...")
+                        time.sleep(2)
+                        continue
 
                     signal = "BUY" if buy else "SELL" if sell else "HOLD"
                     price  = last["close"]
