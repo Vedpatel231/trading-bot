@@ -1,2 +1,1 @@
-crypto: python bot.py
-stocks: python bot_stocks.py
+worker: python bot.py & python bot_stocks.py & wait
