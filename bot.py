@@ -58,8 +58,8 @@ def start_health_server():
 # ══════════════════════════════════════════════════════════════
 
 CRYPTO_SYMBOLS      = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-CRYPTO_TIMEFRAME    = "5m"       # entry timeframe — changed to 5m
-CRYPTO_HTF          = "1h"       # higher timeframe — changed to 1h
+CRYPTO_TIMEFRAME    = "1m"       # entry timeframe — changed to 5m
+CRYPTO_HTF          = "5h"       # higher timeframe — changed to 1h
 FAST_EMA            = 5
 SLOW_EMA            = 50
 RSI_PERIOD          = 14
@@ -69,7 +69,7 @@ STOP_LOSS_PCT       = 0.02
 TAKE_PROFIT_PCT     = 0.04
 CRYPTO_BALANCE      = 10000.0
 RISK_PER_TRADE      = 0.02
-CRYPTO_INTERVAL     = 60 * 5    # check every 5 minutes
+CRYPTO_INTERVAL     = 60 * 1    # check every 5 minutes
 
 exchange = ccxt.binanceus()
 
@@ -241,7 +241,7 @@ STOCK_SYMBOLS    = ["VOO", "QQQ", "SPY"]
 STOCK_FAST_EMA   = 10
 STOCK_SLOW_EMA   = 50
 STOCK_BALANCE    = 10000.0
-STOCK_INTERVAL   = 60 * 15
+STOCK_INTERVAL   = 60 * 1
 
 ALPACA_API_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET_KEY = os.getenv("ALPACA_SECRET_KEY", "")
