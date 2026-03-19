@@ -5,7 +5,9 @@ import time
 import logging
 import requests
 import os
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # ── Logging ────────────────────────────────────────────────────
 logging.basicConfig(
@@ -15,29 +17,28 @@ logging.basicConfig(
 )
 
 # ══════════════════════════════════════════════════════════════
-#  SETTINGS — edit these
+#  SETTINGS
 # ══════════════════════════════════════════════════════════════
 
-SYMBOLS         = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]  # coins to trade
-TIMEFRAME       = "1h"       # entry timeframe
-HTF_TIMEFRAME   = "4h"       # higher timeframe trend filter
-FAST_EMA        = 5          # fast EMA period
-SLOW_EMA        = 50         # slow EMA period
+SYMBOLS         = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+TIMEFRAME       = "1h"
+HTF_TIMEFRAME   = "4h"
+FAST_EMA        = 5
+SLOW_EMA        = 50
 RSI_PERIOD      = 14
 RSI_OVERBOUGHT  = 70
 RSI_OVERSOLD    = 30
-STOP_LOSS_PCT   = 0.02       # exit if price drops 2% from highest point
-TAKE_PROFIT_PCT = 0.04       # exit if price rises 4% from entry
-PAPER_BALANCE   = 10000.0    # starting fake USD
-RISK_PER_TRADE  = 0.02       # risk 2% of each coin's balance per trade
-CHECK_INTERVAL  = 60 * 60    # check every 1 hour (in seconds)
+STOP_LOSS_PCT   = 0.02
+TAKE_PROFIT_PCT = 0.04
+PAPER_BALANCE   = 10000.0
+RISK_PER_TRADE  = 0.02
+CHECK_INTERVAL  = 60 * 60
 
-# ── Telegram — set these in Railway environment variables ──────
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 # ══════════════════════════════════════════════════════════════
-#  PAPER TRADING STATE — one entry per coin
+#  PAPER TRADING STATE
 # ══════════════════════════════════════════════════════════════
 
 paper = {
@@ -55,18 +56,34 @@ paper = {
 }
 
 # ══════════════════════════════════════════════════════════════
-#  EXCHANGE — Binance US (works in the US, no API key needed
-#             for price data)
+#  EXCHANGE
 # ══════════════════════════════════════════════════════════════
 
 exchange = ccxt.binanceus()
+
+# ══════════════════════════════════════════════════════════════
+#  HEALTH CHECK SERVER — keeps Railway alive
+# ══════════════════════════════════════════════════════════════
+
+class HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running")
+    def log_message(self, format, *args):
+        pass  # suppress noisy server logs
+
+def start_health_server():
+    port = int(os.getenv("PORT", 8080))
+    server = HTTPServer(("0.0.0.0", port), HealthHandler)
+    print(f"Health server running on port {port}")
+    server.serve_forever()
 
 # ══════════════════════════════════════════════════════════════
 #  TELEGRAM
 # ══════════════════════════════════════════════════════════════
 
 def send_telegram(msg):
-    """Send a message to your Telegram bot."""
     if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
         return
     try:
@@ -84,7 +101,6 @@ def send_telegram(msg):
 # ══════════════════════════════════════════════════════════════
 
 def fetch_candles(symbol, timeframe, limit=100):
-    """Fetch OHLCV candles from Binance US."""
     bars = exchange.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)
     df = pd.DataFrame(
         bars,
@@ -95,7 +111,6 @@ def fetch_candles(symbol, timeframe, limit=100):
     return df
 
 def add_indicators(df):
-    """Add EMA, RSI and volume average to dataframe."""
     df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=FAST_EMA)
     df["ema_slow"] = ta.trend.ema_indicator(df["close"], window=SLOW_EMA)
     df["rsi"]      = ta.momentum.rsi(df["close"], window=RSI_PERIOD)
@@ -103,10 +118,6 @@ def add_indicators(df):
     return df
 
 def get_htf_trend(symbol):
-    """
-    Check 4h chart to get overall trend direction.
-    Returns 'UP', 'DOWN', or 'NEUTRAL'.
-    """
     try:
         df   = fetch_candles(symbol, HTF_TIMEFRAME, limit=60)
         df   = add_indicators(df)
@@ -121,24 +132,20 @@ def get_htf_trend(symbol):
         return "NEUTRAL"
 
 def get_signal(df):
-    """
-    Return BUY, SELL, or HOLD based on EMA crossover + RSI + volume.
-    Looks at last two candles to detect the crossover moment.
-    """
     prev = df.iloc[-2]
     last = df.iloc[-1]
 
     buy = (
-        prev["ema_fast"] < prev["ema_slow"] and   # was below
-        last["ema_fast"] > last["ema_slow"] and   # now above = crossover
-        last["rsi"]      < RSI_OVERBOUGHT  and    # not overbought
-        last["volume"]   > last["vol_avg"] * 0.8  # decent volume
+        prev["ema_fast"] < prev["ema_slow"] and
+        last["ema_fast"] > last["ema_slow"] and
+        last["rsi"]      < RSI_OVERBOUGHT   and
+        last["volume"]   > last["vol_avg"] * 0.8
     )
 
     sell = (
-        prev["ema_fast"] > prev["ema_slow"] and   # was above
-        last["ema_fast"] < last["ema_slow"] and   # now below = crossover
-        last["rsi"]      > RSI_OVERSOLD           # not oversold
+        prev["ema_fast"] > prev["ema_slow"] and
+        last["ema_fast"] < last["ema_slow"] and
+        last["rsi"]      > RSI_OVERSOLD
     )
 
     if buy:  return "BUY",  last["close"], last["rsi"]
@@ -150,7 +157,6 @@ def get_signal(df):
 # ══════════════════════════════════════════════════════════════
 
 def paper_buy(symbol, price):
-    """Simulate a buy order."""
     p = paper[symbol]
     if p["in_trade"]:
         return
@@ -159,7 +165,6 @@ def paper_buy(symbol, price):
     coin_qty = spend / price
 
     if spend < 1.0:
-        print(f"  Not enough balance to trade {symbol}")
         return
 
     p["balance"]        -= spend
@@ -186,7 +191,6 @@ def paper_buy(symbol, price):
     send_telegram(msg)
 
 def paper_sell(symbol, price, reason="Signal"):
-    """Simulate a sell order."""
     p = paper[symbol]
     if not p["in_trade"]:
         return
@@ -194,10 +198,10 @@ def paper_sell(symbol, price, reason="Signal"):
     proceeds = p["coin_held"] * price
     pnl      = proceeds - (p["coin_held"] * p["entry_price"])
 
-    p["balance"]     += proceeds
+    p["balance"]      += proceeds
     p["total_trades"] += 1
-    p["coin_held"]    = 0.0
-    p["in_trade"]     = False
+    p["coin_held"]     = 0.0
+    p["in_trade"]      = False
     p["highest_price"] = 0.0
 
     if pnl >= 0:
@@ -233,15 +237,10 @@ def paper_sell(symbol, price, reason="Signal"):
 # ══════════════════════════════════════════════════════════════
 
 def check_exit_conditions(symbol, price):
-    """
-    Check trailing stop-loss and take-profit on every tick.
-    Called before the main signal check each hour.
-    """
     p = paper[symbol]
     if not p["in_trade"]:
         return
 
-    # Update the highest price seen since entry
     if price > p["highest_price"]:
         p["highest_price"] = price
 
@@ -258,7 +257,6 @@ def check_exit_conditions(symbol, price):
 # ══════════════════════════════════════════════════════════════
 
 def print_portfolio_summary():
-    """Print a summary of all coin balances and trade stats."""
     print("\n" + "─" * 58)
     total = 0
     for symbol in SYMBOLS:
@@ -280,7 +278,6 @@ def print_portfolio_summary():
 # ══════════════════════════════════════════════════════════════
 
 def run():
-    """Main bot loop — runs forever, checks every hour."""
     coin_names = ", ".join(s.split("/")[0] for s in SYMBOLS)
 
     startup_msg = (
@@ -304,15 +301,12 @@ def run():
         for symbol in SYMBOLS:
             coin = symbol.split("/")[0]
             try:
-                # 1. Check stop-loss / take-profit on open positions
                 df_now        = fetch_candles(symbol, TIMEFRAME, limit=5)
                 current_price = df_now["close"].iloc[-1]
                 check_exit_conditions(symbol, current_price)
 
-                # 2. Get higher timeframe trend
                 htf = get_htf_trend(symbol)
 
-                # 3. Get entry signal on main timeframe
                 df             = fetch_candles(symbol, TIMEFRAME, limit=100)
                 df             = add_indicators(df)
                 signal, price, rsi = get_signal(df)
@@ -325,17 +319,14 @@ def run():
                     f"${price:>10,.2f} | {status}"
                 )
 
-                # 4. Act on signal
                 if signal == "BUY":
                     if htf == "UP":
                         paper_buy(symbol, price)
                     else:
                         print(f"        BUY blocked — 4h trend is {htf}")
-
                 elif signal == "SELL":
                     paper_sell(symbol, price)
 
-                # Small pause between coins to avoid rate limits
                 time.sleep(2)
 
             except Exception as e:
@@ -347,4 +338,8 @@ def run():
 
 
 if __name__ == "__main__":
+    # Start health check server in background thread — keeps Railway alive
+    thread = threading.Thread(target=start_health_server, daemon=True)
+    thread.start()
+    # Start the bot
     run()
