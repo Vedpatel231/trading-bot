@@ -272,14 +272,17 @@ def run_stocks():
  
             for symbol in STOCK_SYMBOLS:
                 try:
-                    # Fetch daily bars and reset index to avoid indexing errors
-                    raw  = alpaca.get_bars(symbol, TimeFrame.Day, limit=200).df
-                    bars = raw.copy().reset_index(drop=True)
+                    # Fetch data from Yahoo Finance — free, reliable, no API key needed
+                    import yfinance as yf
+                    ticker = yf.Ticker(symbol)
+                    bars   = ticker.history(period="1y", interval="1d")
+                    bars   = bars.reset_index(drop=True)
  
                     if len(bars) < 60:
-                        print(f"  {symbol:<4} | only {len(bars)} bars — need 60+, skipping")
+                        print(f"  {symbol:<4} | only {len(bars)} bars — skipping")
                         continue
  
+                    bars.columns = [c.lower() for c in bars.columns]
                     bars["ema_fast"] = ta.trend.ema_indicator(bars["close"], window=S_FAST_EMA)
                     bars["ema_slow"] = ta.trend.ema_indicator(bars["close"], window=S_SLOW_EMA)
                     bars["rsi"]      = ta.momentum.rsi(bars["close"], window=RSI_PERIOD)
@@ -295,7 +298,7 @@ def run_stocks():
  
                     trend = "UP" if last["ema_fast"] > last["ema_slow"] else "DOWN"
  
-                    # Check exits
+                    # Check exits on open positions
                     p = stock_paper[symbol]
                     if p["in_trade"]:
                         if price > p["highest_price"]: p["highest_price"] = price
@@ -344,3 +347,4 @@ if __name__ == "__main__":
     print("All bots running.")
     while True:
         time.sleep(60)
+ 
