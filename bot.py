@@ -56,8 +56,8 @@ def start_health_server():
 CRYPTO_SYMBOLS   = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 CRYPTO_TF        = "1m"
 CRYPTO_HTF       = "5m"
-FAST_EMA         = 5
-SLOW_EMA         = 50
+FAST_EMA         = 9
+SLOW_EMA         = 21
 RSI_PERIOD       = 14
 RSI_OB           = 70
 RSI_OS           = 30
