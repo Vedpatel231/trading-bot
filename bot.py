@@ -19,8 +19,8 @@ logging.basicConfig(
 # ══════════════════════════════════════════════════════════════
 
 SYMBOLS        = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]  # coins to trade
-TIMEFRAME      = "15m"          # entry timeframe
-HTF_TIMEFRAME  = "1h"          # higher timeframe trend filter
+TIMEFRAME      = "1h"          # entry timeframe
+HTF_TIMEFRAME  = "4h"          # higher timeframe trend filter
 FAST_EMA       = 5             # fast EMA period
 SLOW_EMA       = 50            # slow EMA period
 RSI_PERIOD     = 14
@@ -30,7 +30,7 @@ STOP_LOSS_PCT  = 0.02          # exit if price drops 2% from entry
 TAKE_PROFIT_PCT = 0.04         # exit if price rises 4% from entry
 PAPER_BALANCE  = 10000.0       # starting fake USD (shared across all coins)
 RISK_PER_TRADE = 0.02          # risk 2% of balance per trade
-CHECK_INTERVAL = 60 * 15       # check every 1 hour
+CHECK_INTERVAL = 60 * 60       # check every 1 hour
 
 # Telegram — fill these in (see setup guide below)
 TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
