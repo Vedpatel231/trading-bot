@@ -446,7 +446,7 @@ def run_crypto():
                     macd_dir        = "↑" if not pd.isna(last["macd_hist"]) and last["macd_hist"] > 0 else "↓"
                     bb_pct          = ((price - float(last["bb_lower"])) / price * 100) if not pd.isna(last["bb_lower"]) else 0
 
-                    print(f"  {coin:<4} | {sig:<4} | 5m:{trend:<7} | "
+                    print(f"  {coin:<4} | {sig:<4} | 4h:{trend:<7} | "
                           f"RSI:{rsi:>5.1f} | MACD:{macd_dir} | "
                           f"BB%:{bb_pct:>4.1f} | ${price:>10,.2f} | {st}")
 
