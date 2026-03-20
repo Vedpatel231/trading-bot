@@ -410,7 +410,7 @@ def run_stocks():
 
     msg = (f"📈 <b>Stocks bot started</b>\n"
            f"Stocks:  {', '.join(STOCK_SYMBOLS)}\n"
-           f"EMA:     {S_FAST_EMA}/{S_SLOW_EMA}  |  RSI: {RSI_PERIOD}\n"
+           f"Strategy: EMA {S_FAST_EMA}/{S_SLOW_EMA} + RSI + BB + 200EMA + Volume\n"
            f"SL: {SL_PCT*100:.1f}%  |  TP: {TP_PCT*100:.1f}%\n"
            f"Balance: ${STOCK_BAL:,.2f}  (paper)\n"
            f"Hours:   Mon-Fri 9:30am-4pm ET only")
@@ -433,25 +433,69 @@ def run_stocks():
             for symbol in STOCK_SYMBOLS:
                 try:
                     import yfinance as yf
-                    bars = yf.Ticker(symbol).history(period="1y", interval="1d")
+                    bars = yf.Ticker(symbol).history(period="2y", interval="1d")
                     bars = bars.reset_index(drop=True)
                     bars.columns = [c.lower() for c in bars.columns]
-                    if len(bars) < 60:
-                        print(f"  {symbol:<4} | not enough bars — skipping"); continue
+                    if len(bars) < 200:
+                        print(f"  {symbol:<4} | not enough bars ({len(bars)}) — skipping"); continue
 
-                    bars["ema_fast"] = ta.trend.ema_indicator(bars["close"], window=S_FAST_EMA)
-                    bars["ema_slow"] = ta.trend.ema_indicator(bars["close"], window=S_SLOW_EMA)
-                    bars["rsi"]      = ta.momentum.rsi(bars["close"], window=RSI_PERIOD)
+                    # ── Indicators ─────────────────────────────────────
+                    bars["ema_fast"]  = ta.trend.ema_indicator(bars["close"], window=S_FAST_EMA)
+                    bars["ema_slow"]  = ta.trend.ema_indicator(bars["close"], window=S_SLOW_EMA)
+                    bars["ema_200"]   = ta.trend.ema_indicator(bars["close"], window=200)
+                    bars["rsi"]       = ta.momentum.rsi(bars["close"], window=RSI_PERIOD)
+                    bars["vol_avg"]   = bars["volume"].rolling(20).mean()
+                    bars["vol_spike"] = bars["volume"] > bars["vol_avg"] * 1.2
+
+                    # Bollinger Bands
+                    bb = ta.volatility.BollingerBands(bars["close"], window=20, window_dev=2)
+                    bars["bb_upper"] = bb.bollinger_hband()
+                    bars["bb_lower"] = bb.bollinger_lband()
+                    bars["bb_mid"]   = bb.bollinger_mavg()
 
                     prev  = bars.iloc[-2]
                     last  = bars.iloc[-1]
                     price = float(last["close"])
-                    rsi   = float(last["rsi"]) if not pd.isna(last["rsi"]) else None
-                    if rsi is None: continue
+                    rsi   = float(last["rsi"])   if not pd.isna(last["rsi"])   else None
+                    e200  = float(last["ema_200"]) if not pd.isna(last["ema_200"]) else None
 
-                    trend = "UP" if last["ema_fast"] > last["ema_slow"] else "DOWN"
-                    p     = stock_paper[symbol]
+                    if rsi is None or e200 is None:
+                        print(f"  {symbol:<4} | indicators not ready — skipping"); continue
 
+                    # ── Signal logic ───────────────────────────────────
+                    # EMA crossover confirmed 2 days in a row
+                    ema_cross_up   = (prev["ema_fast"] < prev["ema_slow"] and
+                                      last["ema_fast"] > last["ema_slow"])
+                    ema_cross_down = (prev["ema_fast"] > prev["ema_slow"] and
+                                      last["ema_fast"] < last["ema_slow"])
+
+                    above_200      = price > e200          # above 200 EMA = institutional uptrend
+                    vol_spike      = bool(last["vol_spike"])
+                    near_bb_lower  = price <= last["bb_lower"] * 1.005
+                    near_bb_upper  = price >= last["bb_upper"] * 0.995
+
+                    # BUY: crossover UP + above 200 EMA + RSI healthy + volume
+                    buy = (
+                        ema_cross_up  and
+                        above_200     and         # only buy in institutional uptrend
+                        35 < rsi < 65 and         # RSI in healthy zone
+                        vol_spike                  # real volume
+                    )
+
+                    # SELL: crossover DOWN + RSI not oversold + volume
+                    sell = (
+                        ema_cross_down and
+                        rsi > 35       and
+                        vol_spike
+                    )
+
+                    sig    = "BUY" if buy else "SELL" if sell else "HOLD"
+                    trend  = "UP" if last["ema_fast"] > last["ema_slow"] else "DOWN"
+                    inst   = "↑" if above_200 else "↓"   # institutional trend indicator
+                    status = "IN TRADE" if stock_paper[symbol]["in_trade"] else "watching"
+                    p      = stock_paper[symbol]
+
+                    # Check exits
                     if p["in_trade"]:
                         if price > p["highest_price"]: p["highest_price"] = price
                         if price <= p["highest_price"] * (1 - SL_PCT):
@@ -459,18 +503,13 @@ def run_stocks():
                         elif price >= p["entry_price"] * (1 + TP_PCT):
                             s_sell(symbol, price, "Take profit")
 
-                    buy  = (prev["ema_fast"] < prev["ema_slow"] and
-                            last["ema_fast"] > last["ema_slow"] and rsi < 70)
-                    sell = (prev["ema_fast"] > prev["ema_slow"] and
-                            last["ema_fast"] < last["ema_slow"] and rsi > 30)
-
-                    sig    = "BUY" if buy else "SELL" if sell else "HOLD"
-                    status = "IN TRADE" if p["in_trade"] else "watching"
-                    print(f"  {symbol:<4} | {sig:<4} | Trend:{trend:<7} | RSI:{rsi:>5.1f} | ${price:>8,.2f} | {status}")
+                    print(f"  {symbol:<4} | {sig:<4} | EMA:{trend:<5} | "
+                          f"200:{inst} | RSI:{rsi:>5.1f} | "
+                          f"Vol:{'↑' if vol_spike else '-'} | "
+                          f"${price:>8,.2f} | {status}")
 
                     if sig == "BUY" and not p["in_trade"]:
-                        if trend == "UP": s_buy(symbol, price)
-                        else: print(f"        BUY blocked — trend: {trend}")
+                        s_buy(symbol, price)
                     elif sig == "SELL" and p["in_trade"]:
                         s_sell(symbol, price)
 
