@@ -53,7 +53,7 @@ def start_health_server():
 
 CRYPTO_SYMBOLS   = ["ETH/USDT", "SOL/USDT"]
 CRYPTO_TF        = "1h"
-CRYPTO_HTF       = "4h"
+CRYPTO_HTF       = "2h"
 FAST_EMA         = 7
 SLOW_EMA         = 18
 RSI_PERIOD       = 14
@@ -68,7 +68,7 @@ SL_PCT           = 0.003
 TP_PCT           = 0.015
 CRYPTO_BAL       = 10000.0
 RISK             = 0.02
-CHECK_INTERVAL   = 60 * 60
+CHECK_INTERVAL   = 60 * 5
 
 # ── Risk management settings ───────────────────────────────
 DAILY_LOSS_LIMIT  = 0.03      # stop trading if down 3% today
