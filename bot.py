@@ -415,6 +415,8 @@ def run_crypto():
 
     while True:
         try:
+            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking crypto...")
+
             if perf["paused"]:
                 reset_daily_stats()
                 if not perf["paused"]:
@@ -688,12 +690,27 @@ def run_stocks():
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
-    threading.Thread(target=start_health_server,   daemon=True).start()
+    # Health server FIRST — Railway needs this responding immediately
+    threading.Thread(target=start_health_server, daemon=True).start()
+    print(f"Health server running on port {os.getenv('PORT', 8080)}")
+
+    # Small delay then start bots
+    time.sleep(2)
+    threading.Thread(target=run_crypto, daemon=True).start()
     time.sleep(3)
-    threading.Thread(target=run_crypto,            daemon=True).start()
-    time.sleep(5)
-    threading.Thread(target=run_stocks,            daemon=True).start()
+    threading.Thread(target=run_stocks, daemon=True).start()
+    time.sleep(1)
     threading.Thread(target=schedule_daily_report, daemon=True).start()
+
     print("All bots running.")
+
+    # Keep main thread alive forever — never let this crash
     while True:
-        time.sleep(60)
+        try:
+            time.sleep(30)
+        except KeyboardInterrupt:
+            print("Shutting down...")
+            break
+        except Exception as e:
+            print(f"Main thread error (continuing): {e}")
+            time.sleep(30)
