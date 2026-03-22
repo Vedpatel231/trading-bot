@@ -68,7 +68,7 @@ SL_PCT           = 0.003
 TP_PCT           = 0.015
 CRYPTO_BAL       = 10000.0
 RISK             = 0.02
-CHECK_INTERVAL   = 60 * 5
+CHECK_INTERVAL   = 60 * 5     # check every 5 min, act on 1h candles only
 
 # ── Risk management settings ───────────────────────────────
 DAILY_LOSS_LIMIT  = 0.03      # stop trading if down 3% today
@@ -446,7 +446,7 @@ def run_crypto():
                     macd_dir        = "↑" if not pd.isna(last["macd_hist"]) and last["macd_hist"] > 0 else "↓"
                     bb_pct          = ((price - float(last["bb_lower"])) / price * 100) if not pd.isna(last["bb_lower"]) else 0
 
-                    print(f"  {coin:<4} | {sig:<4} | 4h:{trend:<7} | "
+                    print(f"  {coin:<4} | {sig:<4} | 2h:{trend:<7} | "
                           f"RSI:{rsi:>5.1f} | MACD:{macd_dir} | "
                           f"BB%:{bb_pct:>4.1f} | ${price:>10,.2f} | {st}")
 
@@ -454,7 +454,7 @@ def run_crypto():
                         if trend == "UP" and is_trading_allowed(symbol):
                             crypto_buy(symbol, price, rsi, atr)
                         elif trend != "UP":
-                            print(f"        BUY blocked — 5m: {trend}")
+                            print(f"        BUY blocked — 2h: {trend}")
 
                     elif sig == "SELL" and p["in_trade"]:
                         crypto_sell(symbol, price, reason="Signal")
@@ -471,12 +471,12 @@ def run_crypto():
 #  STOCKS SETTINGS
 # ══════════════════════════════════════════════════════════════
 
-STOCK_SYMBOLS  = ["VOO", "QQQ", "SPY"]
+STOCK_SYMBOLS  = ["SPY", "QQQ"]
 S_FAST_EMA     = 10
 S_SLOW_EMA     = 50
 STOCK_BAL      = 10000.0
-STOCK_SLEEP    = 60 * 15
-MARKET_OPEN_AVOID_MINS = 30   # avoid first and last 30 min
+STOCK_SLEEP    = 60 * 5      # check every 5 min
+MARKET_OPEN_AVOID_MINS = 0    # trade full market hours 9:30am-4pm
 
 ALPACA_KEY    = os.getenv("ALPACA_API_KEY", "")
 ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "")
