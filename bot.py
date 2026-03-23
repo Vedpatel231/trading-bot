@@ -52,8 +52,8 @@ def start_health_server():
 # ══════════════════════════════════════════════════════════════
 
 CRYPTO_SYMBOLS   = ["ETH/USDT", "SOL/USDT"]
-CRYPTO_TF        = "1h"
-CRYPTO_HTF       = "2h"
+CRYPTO_TF        = "30m"
+CRYPTO_HTF       = "1h"
 FAST_EMA         = 7
 SLOW_EMA         = 18
 RSI_PERIOD       = 14
@@ -68,7 +68,7 @@ SL_PCT           = 0.003
 TP_PCT           = 0.015
 CRYPTO_BAL       = 10000.0
 RISK             = 0.02
-CHECK_INTERVAL   = 60 * 5     # check every 5 min, act on 1h candles only
+CHECK_INTERVAL   = 60 * 3     # check every 3 min, act on 30m candles
 
 # ── Risk management settings ───────────────────────────────
 DAILY_LOSS_LIMIT  = 0.03      # stop trading if down 3% today
@@ -400,7 +400,7 @@ def run_crypto():
     msg = (f"🤖 <b>Crypto bot started</b>\n"
            f"Coins:     {coins}\n"
            f"Timeframe: {CRYPTO_TF}  |  HTF: {CRYPTO_HTF}\n"
-           f"Strategy:  EMA {FAST_EMA}/{SLOW_EMA} + MACD + Vol + 2h filter\n"
+           f"Strategy:  EMA {FAST_EMA}/{SLOW_EMA} + MACD + Vol + 1h filter\n"
            f"SL: {SL_PCT*100:.1f}%  |  TP: {TP_PCT*100:.1f}%\n"
            f"Daily limit: {DAILY_LOSS_LIMIT*100:.0f}%  |  Cooldown: {COOLDOWN_MINUTES}min\n"
            f"Balance:   ${CRYPTO_BAL:,.2f}  (paper)")
@@ -442,7 +442,7 @@ def run_crypto():
                     macd_dir        = "↑" if not pd.isna(last["macd_hist"]) and last["macd_hist"] > 0 else "↓"
                     bb_pct          = ((price - float(last["bb_lower"])) / price * 100) if not pd.isna(last["bb_lower"]) else 0
 
-                    print(f"  {coin:<4} | {sig:<4} | 2h:{trend:<7} | "
+                    print(f"  {coin:<4} | {sig:<4} | 1h:{trend:<7} | "
                           f"RSI:{rsi:>5.1f} | MACD:{macd_dir} | "
                           f"BB%:{bb_pct:>4.1f} | ${price:>10,.2f} | {st}")
 
@@ -450,7 +450,7 @@ def run_crypto():
                         if trend == "UP" and is_trading_allowed(symbol):
                             crypto_buy(symbol, price, rsi, atr)
                         elif trend != "UP":
-                            print(f"        BUY blocked — 2h: {trend}")
+                            print(f"        BUY blocked — 1h: {trend}")
 
                     elif sig == "SELL" and p["in_trade"]:
                         crypto_sell(symbol, price, reason="Signal")
@@ -575,7 +575,7 @@ def run_stocks():
 
     msg = (f"📈 <b>Stocks bot started</b>\n"
            f"Stocks:   {', '.join(STOCK_SYMBOLS)}\n"
-           f"Strategy: EMA {S_FAST_EMA}/{S_SLOW_EMA} + RSI + BB + 200EMA + MACD + Vol\n"
+           f"Strategy: EMA {S_FAST_EMA}/{S_SLOW_EMA} + MACD + VWAP + 200EMA\n"
            f"Time filter: avoid first/last {MARKET_OPEN_AVOID_MINS}min\n"
            f"Cooldown: {COOLDOWN_MINUTES}min after loss\n"
            f"Balance:  ${STOCK_BAL:,.2f}  (paper)")
@@ -612,8 +612,7 @@ def run_stocks():
                     bars["ema_slow"] = ta.trend.ema_indicator(bars["close"], window=S_SLOW_EMA)
                     bars["ema_200"]  = ta.trend.ema_indicator(bars["close"], window=200)
                     bars["rsi"]      = ta.momentum.rsi(bars["close"], window=RSI_PERIOD)
-                    bars["vol_avg"]  = bars["volume"].rolling(20).mean()
-                    bars["vol_spike"]= bars["volume"] > bars["vol_avg"] * 1.2
+                    bars["vwap"]     = (bars["close"] * bars["volume"]).cumsum() / bars["volume"].cumsum()
 
                     macd_s = ta.trend.MACD(bars["close"], window_fast=12, window_slow=26, window_sign=9)
                     bars["macd"]        = macd_s.macd()
@@ -625,22 +624,24 @@ def run_stocks():
                     price = float(last["close"])
                     rsi   = float(last["rsi"])   if not pd.isna(last["rsi"])   else None
                     e200  = float(last["ema_200"]) if not pd.isna(last["ema_200"]) else None
+                    vwap  = float(last["vwap"])  if not pd.isna(last["vwap"])  else None
                     if rsi is None or e200 is None: continue
 
                     above_200    = price > e200
-                    vol_spike    = bool(last["vol_spike"])
+                    above_vwap   = price > vwap if vwap else True
                     macd_bullish = (not pd.isna(last["macd_hist"]) and last["macd_hist"] > 0)
                     macd_bearish = (not pd.isna(last["macd_hist"]) and last["macd_hist"] < 0)
 
+                    # 1-candle crossover (optimizer: 2-candle HURTS stocks)
                     ema_cross_up   = (prev["ema_fast"] < prev["ema_slow"] and
                                       last["ema_fast"] > last["ema_slow"])
                     ema_cross_down = (prev["ema_fast"] > prev["ema_slow"] and
                                       last["ema_fast"] < last["ema_slow"])
 
+                    # Optimized: EMA + MACD + VWAP + 200EMA (removed RSI + Volume)
                     buy  = (ema_cross_up   and above_200 and
-                            35 < rsi < 65  and macd_bullish and vol_spike)
-                    sell = (ema_cross_down and rsi > 35 and
-                            macd_bearish   and vol_spike)
+                            macd_bullish   and above_vwap)
+                    sell = (ema_cross_down and macd_bearish)
 
                     sig    = "BUY" if buy else "SELL" if sell else "HOLD"
                     trend  = "UP" if last["ema_fast"] > last["ema_slow"] else "DOWN"
@@ -662,9 +663,10 @@ def run_stocks():
                         if elapsed < COOLDOWN_MINUTES:
                             can_trade = False
 
+                    vwap_dir = "↑" if above_vwap else "↓"
                     print(f"  {symbol:<4} | {sig:<4} | EMA:{trend:<5} | "
                           f"200:{inst} | MACD:{'↑' if macd_bullish else '↓'} | "
-                          f"RSI:{rsi:>5.1f} | ${price:>8,.2f} | {status}")
+                          f"VWAP:{vwap_dir} | ${price:>8,.2f} | {status}")
 
                     if sig == "BUY" and not p["in_trade"] and can_trade:
                         s_buy(symbol, price)
