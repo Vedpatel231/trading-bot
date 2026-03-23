@@ -213,50 +213,44 @@ def htf_trend(symbol):
 
 def get_signal(df):
     """
-    Multi-indicator signal with MACD confirmation added.
-    BUY:  EMA cross UP (2 candle) + RSI zone + MACD bullish
-          + above VWAP + volume spike
-    SELL: EMA cross DOWN (2 candle) + RSI zone + MACD bearish
-          + volume spike
+    Optimized signal — only indicators that HELP remain.
+    BUY:  EMA cross UP (1 candle) + MACD bullish + volume spike
+    SELL: EMA cross DOWN (1 candle) + MACD bearish + volume spike
+    Removed: RSI (neutral), VWAP (hurts), 2-candle confirm (neutral)
     """
     if len(df) < max(BB_PERIOD, MACD_SLOW) + 5:
         return "HOLD", df["close"].iloc[-1], 50.0, 0.0
 
-    prev2 = df.iloc[-3]
     prev  = df.iloc[-2]
     last  = df.iloc[-1]
     price = last["close"]
     rsi   = last["rsi"]
     atr   = last["atr"] if not pd.isna(last["atr"]) else 0
 
-    if pd.isna(rsi) or pd.isna(last["bb_lower"]) or pd.isna(last["macd"]):
+    if pd.isna(rsi) or pd.isna(last["macd"]):
         return "HOLD", price, 50.0, atr
 
-    ema_cross_up   = (prev2["ema_fast"] < prev2["ema_slow"] and
-                      prev["ema_fast"]  > prev["ema_slow"]  and
-                      last["ema_fast"]  > last["ema_slow"])
+    # 1-candle EMA crossover (faster entry)
+    ema_cross_up   = (prev["ema_fast"] < prev["ema_slow"] and
+                      last["ema_fast"] > last["ema_slow"])
 
-    ema_cross_down = (prev2["ema_fast"] > prev2["ema_slow"] and
-                      prev["ema_fast"]  < prev["ema_slow"]  and
-                      last["ema_fast"]  < last["ema_slow"])
+    ema_cross_down = (prev["ema_fast"] > prev["ema_slow"] and
+                      last["ema_fast"] < last["ema_slow"])
 
-    # MACD confirmation
+    # MACD confirmation (HELPS — PF 1.30 → 1.50)
     macd_bullish = (last["macd"] > last["macd_signal"] and
                     last["macd_hist"] > 0)
     macd_bearish = (last["macd"] < last["macd_signal"] and
                     last["macd_hist"] < 0)
 
-    above_vwap = price > last["vwap"]
-    vol_spike  = bool(last["vol_spike"])
+    # Volume spike (HELPS — PF 1.30 → 1.52)
+    vol_spike = bool(last["vol_spike"])
 
     buy = (ema_cross_up   and
-           RSI_OS < rsi < RSI_OB and
            macd_bullish   and
-           above_vwap     and
            vol_spike)
 
     sell = (ema_cross_down and
-            rsi > RSI_OS   and
             macd_bearish   and
             vol_spike)
 
@@ -406,7 +400,7 @@ def run_crypto():
     msg = (f"🤖 <b>Crypto bot started</b>\n"
            f"Coins:     {coins}\n"
            f"Timeframe: {CRYPTO_TF}  |  HTF: {CRYPTO_HTF}\n"
-           f"Strategy:  EMA {FAST_EMA}/{SLOW_EMA} + RSI + MACD + BB + VWAP + ATR\n"
+           f"Strategy:  EMA {FAST_EMA}/{SLOW_EMA} + MACD + Vol + 2h filter\n"
            f"SL: {SL_PCT*100:.1f}%  |  TP: {TP_PCT*100:.1f}%\n"
            f"Daily limit: {DAILY_LOSS_LIMIT*100:.0f}%  |  Cooldown: {COOLDOWN_MINUTES}min\n"
            f"Balance:   ${CRYPTO_BAL:,.2f}  (paper)")
