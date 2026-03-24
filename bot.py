@@ -213,10 +213,11 @@ def htf_trend(symbol):
 
 def get_signal(df):
     """
-    Optimized signal — only indicators that HELP remain.
-    BUY:  EMA cross UP (1 candle) + MACD bullish + volume spike
-    SELL: EMA cross DOWN (1 candle) + MACD bearish + volume spike
-    Removed: RSI (neutral), VWAP (hurts), 2-candle confirm (neutral)
+    Optimized signal for 30m candles.
+    BUY:  EMA cross UP (1 candle) + MACD bullish
+    SELL: EMA cross DOWN (1 candle) + MACD bearish
+    Removed: RSI (neutral), VWAP (hurts), Volume (blocks 30m entries),
+             2-candle confirm (neutral)
     """
     if len(df) < max(BB_PERIOD, MACD_SLOW) + 5:
         return "HOLD", df["close"].iloc[-1], 50.0, 0.0
@@ -243,16 +244,11 @@ def get_signal(df):
     macd_bearish = (last["macd"] < last["macd_signal"] and
                     last["macd_hist"] < 0)
 
-    # Volume spike (HELPS — PF 1.30 → 1.52)
-    vol_spike = bool(last["vol_spike"])
-
     buy = (ema_cross_up   and
-           macd_bullish   and
-           vol_spike)
+           macd_bullish)
 
     sell = (ema_cross_down and
-            macd_bearish   and
-            vol_spike)
+            macd_bearish)
 
     if buy:  return "BUY",  price, rsi, atr
     if sell: return "SELL", price, rsi, atr
@@ -400,7 +396,7 @@ def run_crypto():
     msg = (f"🤖 <b>Crypto bot started</b>\n"
            f"Coins:     {coins}\n"
            f"Timeframe: {CRYPTO_TF}  |  HTF: {CRYPTO_HTF}\n"
-           f"Strategy:  EMA {FAST_EMA}/{SLOW_EMA} + MACD + Vol + 1h filter\n"
+           f"Strategy:  EMA {FAST_EMA}/{SLOW_EMA} + MACD + 1h filter\n"
            f"SL: {SL_PCT*100:.1f}%  |  TP: {TP_PCT*100:.1f}%\n"
            f"Daily limit: {DAILY_LOSS_LIMIT*100:.0f}%  |  Cooldown: {COOLDOWN_MINUTES}min\n"
            f"Balance:   ${CRYPTO_BAL:,.2f}  (paper)")
