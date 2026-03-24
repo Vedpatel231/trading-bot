@@ -57,8 +57,6 @@ CRYPTO_HTF       = "1h"
 FAST_EMA         = 7
 SLOW_EMA         = 18
 RSI_PERIOD       = 14
-BB_PERIOD        = 20
-BB_STD           = 2.0
 MACD_FAST        = 12
 MACD_SLOW        = 26
 MACD_SIGNAL      = 9
@@ -175,12 +173,6 @@ def add_indicators(df):
     df["ema_slow"] = ta.trend.ema_indicator(df["close"], window=SLOW_EMA)
     df["rsi"]      = ta.momentum.rsi(df["close"], window=RSI_PERIOD)
 
-    # Bollinger Bands
-    bb = ta.volatility.BollingerBands(df["close"], window=BB_PERIOD, window_dev=BB_STD)
-    df["bb_upper"] = bb.bollinger_hband()
-    df["bb_lower"] = bb.bollinger_lband()
-    df["bb_mid"]   = bb.bollinger_mavg()
-
     # MACD
     macd = ta.trend.MACD(df["close"], window_fast=MACD_FAST,
                           window_slow=MACD_SLOW, window_sign=MACD_SIGNAL)
@@ -219,7 +211,7 @@ def get_signal(df):
     Removed: RSI (neutral), VWAP (hurts), Volume (blocks 30m entries),
              2-candle confirm (neutral)
     """
-    if len(df) < max(BB_PERIOD, MACD_SLOW) + 5:
+    if len(df) < MACD_SLOW + 5:
         return "HOLD", df["close"].iloc[-1], 50.0, 0.0
 
     prev  = df.iloc[-2]
@@ -436,11 +428,10 @@ def run_crypto():
                     p               = crypto_paper[symbol]
                     st              = "IN TRADE" if p["in_trade"] else "watching"
                     macd_dir        = "↑" if not pd.isna(last["macd_hist"]) and last["macd_hist"] > 0 else "↓"
-                    bb_pct          = ((price - float(last["bb_lower"])) / price * 100) if not pd.isna(last["bb_lower"]) else 0
 
                     print(f"  {coin:<4} | {sig:<4} | 1h:{trend:<7} | "
                           f"RSI:{rsi:>5.1f} | MACD:{macd_dir} | "
-                          f"BB%:{bb_pct:>4.1f} | ${price:>10,.2f} | {st}")
+                          f"${price:>10,.2f} | {st}")
 
                     if sig == "BUY" and not p["in_trade"]:
                         if trend == "UP" and is_trading_allowed(symbol):
