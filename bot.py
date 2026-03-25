@@ -51,7 +51,7 @@ def start_health_server():
 #  CRYPTO SETTINGS
 # ══════════════════════════════════════════════════════════════
 
-CRYPTO_SYMBOLS   = ["ETH/USDT", "SOL/USDT"]
+CRYPTO_SYMBOLS   = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 CRYPTO_TF        = "30m"
 CRYPTO_HTF       = "1h"
 FAST_EMA         = 7
@@ -454,7 +454,7 @@ def run_crypto():
 #  STOCKS SETTINGS
 # ══════════════════════════════════════════════════════════════
 
-STOCK_SYMBOLS  = ["SPY", "QQQ"]
+STOCK_SYMBOLS  = ["VOO", "QQQ", "VGT"]
 S_FAST_EMA     = 10
 S_SLOW_EMA     = 50
 STOCK_BAL      = 10000.0
