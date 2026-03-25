@@ -84,6 +84,7 @@ DAILY_LOSS_LIMIT = 0.03
 
 exchange = ccxt.binanceus()
 last_candle_ts = {s: None for s in CRYPTO_SYMBOLS}
+last_seen_prices = {s: None for s in CRYPTO_SYMBOLS}
 
 crypto_paper = {
     s: {
@@ -137,6 +138,24 @@ def safe_float(value, default=0.0):
 #  RISK MANAGEMENT CHECKS
 # ══════════════════════════════════════════════════════════════
 
+def get_crypto_symbol_equity(symbol, price=None):
+    p = crypto_paper[symbol]
+    equity = p["balance"]
+    if p["in_trade"] and p["coin_held"] > 0:
+        mark_price = price
+        if mark_price is None:
+            mark_price = last_seen_prices.get(symbol)
+        if mark_price is None or mark_price <= 0:
+            mark_price = p["entry_price"]
+        equity += p["coin_held"] * mark_price
+    return equity
+
+
+def get_total_crypto_equity(price_overrides=None):
+    price_overrides = price_overrides or {}
+    return sum(get_crypto_symbol_equity(symbol, price_overrides.get(symbol)) for symbol in CRYPTO_SYMBOLS)
+
+
 def reset_daily_stats():
     today = datetime.now().date()
     if perf["date"] != today:
@@ -147,18 +166,18 @@ def reset_daily_stats():
         perf["pnl"] = 0.0
         perf["paused"] = False
         perf["pause_reason"] = ""
-        total = sum(p["balance"] for p in crypto_paper.values())
-        perf["start_bal"] = total
-        for p in crypto_paper.values():
-            p["daily_start_bal"] = p["balance"]
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] New day — stats reset. Balance: ${total:,.2f}")
+        total_equity = get_total_crypto_equity()
+        perf["start_bal"] = total_equity
+        for symbol in CRYPTO_SYMBOLS:
+            crypto_paper[symbol]["daily_start_bal"] = get_crypto_symbol_equity(symbol)
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] New day — stats reset. Equity: ${total_equity:,.2f}")
 
 
 
 def is_trading_allowed(symbol):
     reset_daily_stats()
-    total_bal = sum(p["balance"] for p in crypto_paper.values())
-    daily_loss = (perf["start_bal"] - total_bal) / perf["start_bal"] if perf["start_bal"] > 0 else 0
+    total_equity = get_total_crypto_equity()
+    daily_loss = (perf["start_bal"] - total_equity) / perf["start_bal"] if perf["start_bal"] > 0 else 0
     if daily_loss >= DAILY_LOSS_LIMIT:
         if not perf["paused"]:
             perf["paused"] = True
@@ -425,7 +444,7 @@ def check_crypto_exits(symbol, price):
 # ══════════════════════════════════════════════════════════════
 
 def send_daily_report():
-    total_bal = sum(p["balance"] for p in crypto_paper.values())
+    total_equity = get_total_crypto_equity()
     total_pnl = sum(p["total_pnl"] for p in crypto_paper.values())
     total_w = sum(p["wins"] for p in crypto_paper.values())
     total_l = sum(p["losses"] for p in crypto_paper.values())
@@ -436,7 +455,7 @@ def send_daily_report():
 
     msg = (
         f"📊 <b>Daily Report — {datetime.now().strftime('%b %d %Y')}</b>\n\n"
-        f"Balance:    ${total_bal:,.2f}\n"
+        f"Equity:     ${total_equity:,.2f}\n"
         f"Today P&L:  ${perf['pnl']:+.2f}\n"
         f"Total P&L:  ${total_pnl:+.2f}\n\n"
         f"Trades:     {total_t}\n"
@@ -495,6 +514,7 @@ def run_crypto():
                     df = add_indicators(fetch_crypto(symbol, CRYPTO_TF, 250))
                     last = df.iloc[-1]
                     price = safe_float(last["close"])
+                    last_seen_prices[symbol] = price
                     check_crypto_exits(symbol, price)
 
                     candle_ts = df.index[-1]
