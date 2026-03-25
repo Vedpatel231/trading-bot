@@ -58,7 +58,7 @@ def start_health_server():
 # ══════════════════════════════════════════════════════════════
 
 CRYPTO_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-CRYPTO_TF = "30m"
+CRYPTO_TF = "15m"
 CRYPTO_HTF = "1h"
 FAST_EMA = 7
 SLOW_EMA = 18
@@ -69,7 +69,7 @@ MACD_SIGNAL = 9
 ATR_PERIOD = 14
 CRYPTO_BAL = 10000.0
 RISK = 0.02
-CHECK_INTERVAL = 60 * 3
+CHECK_INTERVAL = 60 * 2  # check every 2 min for 15m candles
 
 # crypto strategy / risk params
 CRYPTO_STOP_ATR = 1.2
