@@ -556,7 +556,7 @@ def run_crypto():
 #  STOCKS SETTINGS
 # ══════════════════════════════════════════════════════════════
 
-STOCK_SYMBOLS = ["VOO", "QQQ", "VGT"]
+STOCK_SYMBOLS = ["SPY", "QQQ", "TSLA", "NVDA", "AMD"]
 S_FAST_EMA = 10
 S_SLOW_EMA = 50
 STOCK_BAL = 10000.0
