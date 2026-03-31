@@ -59,7 +59,7 @@ def start_health_server():
 
 CRYPTO_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
 CRYPTO_TF = "30m"
-CRYPTO_HTF = "1h"
+CRYPTO_HTF = "4h"
 FAST_EMA = 7
 SLOW_EMA = 18
 RSI_PERIOD = 14
@@ -262,7 +262,7 @@ def add_indicators(df):
 
 def get_crypto_regime(symbol):
     try:
-        df = add_indicators(fetch_crypto(symbol, CRYPTO_HTF, 120))
+        df = add_indicators(fetch_crypto(symbol, CRYPTO_HTF, 250))
         last = df.iloc[-1]
         prev = df.iloc[-2]
         fast_above = safe_float(last["ema_fast"]) > safe_float(last["ema_slow"])
@@ -275,6 +275,10 @@ def get_crypto_regime(symbol):
         regime_down = fast_below and slow_falling and atr_pct >= REGIME_MIN_ATR_PCT
         regime_not_bearish = fast_above or slow_rising
         regime_not_bullish = fast_below or slow_falling
+
+        # Macro bull filter: price above 200-bar EMA on 4h = sustained uptrend, block shorts
+        ema_200 = ta.trend.ema_indicator(df["close"], window=200)
+        macro_bull = safe_float(last["close"]) > safe_float(ema_200.iloc[-1])
 
         if fast_above:
             trend_label = "UP"
@@ -289,10 +293,12 @@ def get_crypto_regime(symbol):
             "label": trend_label, "up": regime_up, "down": regime_down,
             "not_bearish": regime_not_bearish, "not_bullish": regime_not_bullish,
             "slow_rising": slow_rising, "slow_falling": slow_falling, "atr_pct": atr_pct,
+            "macro_bull": macro_bull,
         }
     except Exception:
         return {"label": "NEUTRAL", "up": False, "down": False, "not_bearish": False,
-                "not_bullish": False, "slow_rising": False, "slow_falling": False, "atr_pct": 0.0}
+                "not_bullish": False, "slow_rising": False, "slow_falling": False,
+                "atr_pct": 0.0, "macro_bull": True}
 
 
 
@@ -320,22 +326,27 @@ def get_crypto_signal(df, regime, prev_regime_state):
     regime_just_flipped_down = regime["down"] and not prev_regime_state.get("down", False)
 
     # ══ BULLISH (LONG) ════════════════════════════════
-    trend_buy = ema_cross_up and macd_bullish and regime["up"]
+    # RSI < 65: avoid entering longs in overbought conditions
+    trend_buy = ema_cross_up and macd_bullish and regime["up"] and rsi < 65
+    # Breakout now requires regime["up"] (was regime["not_bearish"]) — stronger filter
     breakout_buy = (price > safe_float(last["recent_high"]) and bool(last["strong_bullish"])
-                    and bool(last["vol_spike"]) and regime["not_bearish"])
+                    and bool(last["vol_spike"]) and regime["up"] and rsi < 65)
     prev_near_ema = safe_float(prev["close"]) <= safe_float(prev["ema_fast"]) * (1 + PULLBACK_BUFFER)
     rebound_candle = bool(last["bullish_candle"]) and price > safe_float(last["ema_fast"]) and price > safe_float(prev["high"])
-    pullback_buy = regime["up"] and prev_near_ema and rebound_candle and macd_improving
-    regimeflip_buy = regime_just_flipped_up and ema_already_above and macd_bullish
+    pullback_buy = regime["up"] and prev_near_ema and rebound_candle and macd_improving and rsi < 65
+    regimeflip_buy = regime_just_flipped_up and ema_already_above and macd_bullish and rsi < 65
 
     # ══ BEARISH (SHORT) ═══════════════════════════════
-    short_trend = ema_cross_down and macd_bearish and regime["down"]
+    # macro_bull: if price is above 200-bar EMA on the HTF, we are in a bull market — skip shorts entirely
+    macro_bull = regime.get("macro_bull", True)
+    # RSI > 35: avoid entering shorts in oversold conditions
+    short_trend = ema_cross_down and macd_bearish and regime["down"] and rsi > 35 and not macro_bull
     short_breakout = (price < safe_float(last["recent_low"]) and bool(last["strong_bearish"])
-                      and bool(last["vol_spike"]) and regime["not_bullish"])
+                      and bool(last["vol_spike"]) and regime["not_bullish"] and rsi > 35 and not macro_bull)
     prev_near_ema_above = safe_float(prev["close"]) >= safe_float(prev["ema_fast"]) * (1 - PULLBACK_BUFFER)
     rejection_candle = bool(last["bearish_candle"]) and price < safe_float(last["ema_fast"]) and price < safe_float(prev["low"])
-    short_pullback = regime["down"] and prev_near_ema_above and rejection_candle and macd_worsening
-    short_regimeflip = regime_just_flipped_down and ema_already_below and macd_bearish
+    short_pullback = regime["down"] and prev_near_ema_above and rejection_candle and macd_worsening and rsi > 35 and not macro_bull
+    short_regimeflip = regime_just_flipped_down and ema_already_below and macd_bearish and rsi > 35 and not macro_bull
 
     sell_signal = ema_cross_down and macd_bearish
     cover_signal = ema_cross_up and macd_bullish
@@ -650,7 +661,7 @@ def run_crypto():
 
                     print(
                         f"  {coin:<4} | {sig['signal']:<5} | {sig['strategy']:<14} | "
-                        f"1h:{regime['label']:<10} | MACD:{macd_dir} | "
+                        f"4h:{regime['label']:<10} | MACD:{macd_dir} | "
                         f"ATR%:{regime['atr_pct']*100:>4.2f} | ${sig['price']:>10,.2f} | {st}"
                     )
 
@@ -666,11 +677,8 @@ def run_crypto():
                             else:
                                 crypto_short(symbol, sig["price"], sig["rsi"], sig["atr"], sig["strategy"])
 
-                    elif p["in_trade"]:
-                        if sig["signal"] == "SELL" and p["trade_direction"] == "long":
-                            crypto_close(symbol, sig["price"], reason="Signal")
-                        elif sig["signal"] == "COVER" and p["trade_direction"] == "short":
-                            crypto_close(symbol, sig["price"], reason="Cover signal")
+                    # NOTE: Removed SELL/COVER early exits — trades now close via ATR stop or TP only.
+                    # Signal-based exits were triggering prematurely on 30m noise and causing most losses.
 
                 except Exception as e:
                     print(f"  {coin} error: {e}")
