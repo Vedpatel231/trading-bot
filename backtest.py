@@ -307,7 +307,8 @@ class OldExitSim:
 
     def process_candle(self, o, h, l, c):
         """
-        Returns (exit_price, reason) or (None, None) if still open.
+        Returns list of (exit_price, reason, qty_fraction) events, or [] if still open.
+        Consistent with NewExitSim interface so the backtest loop works identically.
         Uses conservative intra-candle ordering: stop checked before TP.
         """
         if self.direction == "long":
@@ -316,21 +317,20 @@ class OldExitSim:
                 if self.stop < self.entry:
                     self.stop = self.entry
                     self.be_locked = True
-            # Check stop first (worst-case)
             if l <= self.stop:
-                return max(self.stop, l), "stop"
+                return [(max(self.stop, l), "stop", 1.0)]
             if h >= self.tp:
-                return self.tp, "tp"
+                return [(self.tp, "tp", 1.0)]
         else:
             if not self.be_locked and l <= self.entry - self.atr:
                 if self.stop > self.entry:
                     self.stop = self.entry
                     self.be_locked = True
             if h >= self.stop:
-                return min(self.stop, h), "stop"
+                return [(min(self.stop, h), "stop", 1.0)]
             if l <= self.tp:
-                return self.tp, "tp"
-        return None, None
+                return [(self.tp, "tp", 1.0)]
+        return []
 
     def calc_pnl(self, exit_price, qty=None):
         q = qty or self.qty
@@ -528,6 +528,10 @@ def backtest_symbol(symbol: str, df15: pd.DataFrame, df4h: pd.DataFrame):
     cooldown_new = None
     COOLDOWN_MIN = 45
 
+    def _can_trade(cooldown_ts, current_ts):
+        if cooldown_ts is None: return True
+        return (current_ts - cooldown_ts).total_seconds() / 60 >= COOLDOWN_MIN
+
     rows = list(df.itertuples())
     n    = len(rows)
     print(f"  ▶  {symbol}: simulating {n:,} candles …")
@@ -541,24 +545,32 @@ def backtest_symbol(symbol: str, df15: pd.DataFrame, df4h: pd.DataFrame):
         atr = float(row.atr) if row.atr and not pd.isna(row.atr) else 0.0
 
         # Regime at this timestamp
-        reg_row = regime_reindexed.loc[ts] if ts in regime_reindexed.index else pd.Series({"regime_up":False,"regime_down":False,"macro_bull":True})
-        r_up    = bool(reg_row.get("regime_up",  False))
-        r_down  = bool(reg_row.get("regime_down",False))
-        r_macro = bool(reg_row.get("macro_bull", True))
+        # Bug-fix: after reindex+ffill the first few rows may be NaN;
+        # bool(NaN) raises ValueError, so we cast via fillna first.
+        try:
+            reg_row = regime_reindexed.iloc[i] if i < len(regime_reindexed) else None
+            if reg_row is None or reg_row.isna().all():
+                r_up = False; r_down = False; r_macro = True
+            else:
+                r_up    = bool(reg_row.get("regime_up",  False) == True)
+                r_down  = bool(reg_row.get("regime_down", False) == True)
+                r_macro = bool(reg_row.get("macro_bull",  True)  == True)
+        except Exception:
+            r_up = False; r_down = False; r_macro = True
 
         # ── OLD strategy ─────────────────────────────────────────────
         if in_old:
             events = sim_old.process_candle(o, h, l, c)
-            # Only care about the last exit event (first = partial for old, not applicable)
-            final_exit = next((e for e in reversed(events) if e[1] != "partial"), None)
+            # OldExitSim never returns a "partial" event — just take the first exit
+            final_exit = next((e for e in events if e[1] != "partial"), None)
             if final_exit:
-                xprice, xreason, xfrac = final_exit
+                xprice, xreason, _ = final_exit
                 pnl = sim_old.calc_pnl(xprice)
                 bal_old += pnl
                 trades_old.append({
                     "symbol": symbol, "entry_ts": entry_bar_old,
                     "exit_ts": ts, "direction": sim_old.direction,
-                    "strategy": sim_old.strategy if hasattr(sim_old,"strategy") else "",
+                    "strategy": getattr(sim_old, "strategy", ""),
                     "entry": sim_old.entry, "exit": xprice, "atr": atr,
                     "pnl": round(pnl, 4), "reason": xreason,
                     "half_sold": False, "partial_pnl": 0.0,
@@ -570,24 +582,22 @@ def backtest_symbol(symbol: str, df15: pd.DataFrame, df4h: pd.DataFrame):
 
         if in_new:
             events = sim_new.process_candle(o, h, l, c)
-            partial_pnl_this = 0.0
-            full_exit = None
-            for ev in events:
-                xp, xr, xf = ev
-                if xr == "partial":
-                    partial_pnl_this = sim_new.partial_pnl
-                else:
-                    full_exit = ev
+            # ── Bug-fix: never double-count partial P&L ─────────────
+            # sim_new.partial_pnl is set inside NewExitSim.process_candle()
+            # the moment the partial fires (regardless of which candle).
+            # We only touch bal_new once, at full close.
+            full_exit = next((e for e in events if e[1] != "partial"), None)
 
             if full_exit:
                 xprice, xreason, _ = full_exit
                 remainder_pnl = sim_new.total_pnl(xprice)
-                total_pnl = partial_pnl_this + sim_new.partial_pnl + remainder_pnl
+                # partial_pnl is 0 if no partial fired, or the locked-in partial amount
+                total_pnl = sim_new.partial_pnl + remainder_pnl
                 bal_new += total_pnl
                 trades_new.append({
                     "symbol": symbol, "entry_ts": entry_bar_new,
                     "exit_ts": ts, "direction": sim_new.direction,
-                    "strategy": sim_new.strategy if hasattr(sim_new,"strategy") else "",
+                    "strategy": getattr(sim_new, "strategy", ""),
                     "entry": sim_new.entry, "exit": xprice, "atr": atr,
                     "pnl": round(total_pnl, 4), "reason": xreason,
                     "half_sold": sim_new.half_sold,
@@ -597,16 +607,10 @@ def backtest_symbol(symbol: str, df15: pd.DataFrame, df4h: pd.DataFrame):
                 in_new = False
                 if total_pnl < 0:
                     cooldown_new = ts
-            elif events:  # only partial happened this candle, no full exit
-                bal_new += partial_pnl_this  # bank partial leg
-                sim_new.partial_pnl = partial_pnl_this  # remember for final close
+            # (no elif branch needed — partial P&L is held in sim_new.partial_pnl
+            #  until the full close, keeping the balance curve clean)
 
-        # ── Cooldown check ──
-        def _can_trade(cooldown_ts, ts):
-            if cooldown_ts is None: return True
-            return (ts - cooldown_ts).total_seconds() / 60 >= COOLDOWN_MIN
-
-        # ── Entry signal ─────────────────────────────────────────────
+        # ── Entry signal (skipped if already in a trade for that sim) ────────
         if i + 1 < n and atr > 0:
             try:
                 row_dict = row._asdict()
