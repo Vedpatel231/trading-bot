@@ -114,6 +114,7 @@ crypto_paper = {
         "entry_strategy": "",
         "highest_price": 0.0,
         "lowest_price": 999999.0,
+        "half_sold": False,
         "total_trades": 0,
         "wins": 0,
         "losses": 0,
@@ -544,6 +545,54 @@ def crypto_short(symbol, price, rsi, atr, strategy):
     send_telegram(msg)
 
 
+def crypto_partial_close(symbol, price, reason="Partial TP"):
+    """
+    Sell exactly 50% of the current coin_held at `price`.
+    Updates balance, logs the partial exit, and marks half_sold = True.
+    Does NOT mark in_trade = False — the remaining half stays open.
+    """
+    p = crypto_paper[symbol]
+    if not p["in_trade"] or p["half_sold"]:
+        return
+
+    direction = p["trade_direction"]
+    half_qty  = p["coin_held"] / 2.0
+    coin      = symbol.split("/")[0]
+
+    if direction == "long":
+        proceeds  = half_qty * price
+        exit_fee  = proceeds * TRADING_FEE_PCT
+        pnl       = (proceeds - exit_fee) - (half_qty * p["entry_price"])
+        p["balance"] += proceeds - exit_fee
+    elif direction == "short":
+        raw_pnl  = half_qty * (p["entry_price"] - price)
+        exit_fee = half_qty * price * TRADING_FEE_PCT
+        pnl      = raw_pnl - exit_fee
+        p["balance"] += half_qty * p["entry_price"] + pnl
+    else:
+        proceeds  = half_qty * price
+        exit_fee  = proceeds * TRADING_FEE_PCT
+        pnl       = (proceeds - exit_fee) - (half_qty * p["entry_price"])
+        p["balance"] += proceeds - exit_fee
+
+    p["coin_held"] -= half_qty
+    p["half_sold"]  = True
+    p["total_pnl"] += pnl
+
+    dir_label = "PARTIAL LONG" if direction == "long" else "PARTIAL SHORT"
+    msg = (
+        f"⚡ <b>{dir_label} {coin}</b> ({reason})\n"
+        f"Sold 50% at: ${price:,.2f}\n"
+        f"Fee:         ${exit_fee:.2f}\n"
+        f"Partial P&L: ${pnl:+.2f}\n"
+        f"Remaining:   {p['coin_held']:.6f} {coin}\n"
+        f"Balance:     ${p['balance']:,.2f}"
+    )
+    logging.info(f"  {coin} partial close at ${price:,.2f} | P&L ${pnl:+.2f}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
+    send_telegram(msg)
+
+
 def crypto_close(symbol, price, reason="Signal"):
     """Close any open position — works for both long and short. Deducts exit fee."""
     p = crypto_paper[symbol]
@@ -577,6 +626,7 @@ def crypto_close(symbol, price, reason="Signal"):
     p["trade_direction"] = ""
     p["highest_price"] = 0.0
     p["lowest_price"] = 999999.0
+    p["half_sold"] = False
     p["entry_price"] = 0.0
     p["entry_atr"] = 0.0
     p["stop_price"] = 0.0
@@ -621,46 +671,148 @@ def crypto_close(symbol, price, reason="Signal"):
 
 def check_crypto_exits(symbol, price):
     """
-    Check stop-loss and take-profit for an open position.
-    Uses live ticker price (passed in) for intra-candle accuracy.
-    Also applies breakeven trailing: once trade moves 1 ATR in our favour,
-    the stop is moved up to entry price so a winner can never become a full loss.
+    3-stage exit manager:
+
+    Stage 1 — Normal (half_sold = False, price not yet at 1.5×ATR profit):
+        Stop = entry - 1×ATR  |  TP = entry + 2.5×ATR
+        Breakeven lock: once price >= entry + 1×ATR, stop moves to entry.
+
+    Stage 2 — Partial close (triggered when price >= entry + 1.5×ATR):
+        • Sell 50% of position at current price
+        • Stop moves to entry (breakeven guarantee on remaining half)
+        • TP advances to highest_price + 1×ATR
+        • half_sold flag set to True
+
+    Stage 3 — Trailing (half_sold = True):
+        • As price makes new highs, trail stop = highest_price - 1×ATR
+        • TP = highest_price + 1×ATR
+        • Close remaining half when price hits trailing stop or new TP
+
+    Short positions mirror all of the above symmetrically.
     """
     p = crypto_paper[symbol]
     if not p["in_trade"]:
         return
 
-    entry   = p["entry_price"]
-    atr     = p["entry_atr"]
-    coin    = symbol.split("/")[0]
+    entry = p["entry_price"]
+    atr   = p["entry_atr"]
+    coin  = symbol.split("/")[0]
 
+    if atr <= 0:
+        # Safety: no ATR data — fall back to simple stop/TP
+        if p["trade_direction"] == "long":
+            if price <= p["stop_price"]:
+                crypto_close(symbol, price, reason="ATR stop")
+            elif price >= p["tp_price"]:
+                crypto_close(symbol, price, reason="ATR take profit")
+        elif p["trade_direction"] == "short":
+            if price >= p["stop_price"]:
+                crypto_close(symbol, price, reason="ATR stop")
+            elif price <= p["tp_price"]:
+                crypto_close(symbol, price, reason="ATR take profit")
+        return
+
+    # ── LONG ──────────────────────────────────────────────────────────────────
     if p["trade_direction"] == "long":
+
+        # Always track new highs
         if price > p["highest_price"]:
             p["highest_price"] = price
 
-        # Breakeven trailing: once price clears entry + 1 ATR, lock in breakeven
-        if atr > 0 and price >= entry + atr and p["stop_price"] < entry:
-            p["stop_price"] = entry
-            logging.info(f"  {coin} breakeven stop locked at ${entry:,.2f}")
+        if not p["half_sold"]:
+            # ── Stage 1: breakeven lock ──
+            if price >= entry + atr and p["stop_price"] < entry:
+                p["stop_price"] = entry
+                logging.info(f"  {coin} breakeven stop locked at ${entry:,.2f}")
 
-        if price <= p["stop_price"]:
-            crypto_close(symbol, price, reason="ATR stop")
-        elif price >= p["tp_price"]:
-            crypto_close(symbol, price, reason="ATR take profit")
+            # ── Stage 2: partial close at 1.5×ATR profit ──
+            if price >= entry + 1.5 * atr:
+                # Sell half
+                partial_price = price
+                crypto_partial_close(symbol, partial_price, reason="Partial TP (1.5×ATR)")
 
+                # Lock stop at entry (never lose on remaining half)
+                p["stop_price"] = entry
+                # Advance TP to highest + 1×ATR
+                p["tp_price"] = p["highest_price"] + atr
+                logging.info(
+                    f"  {coin} trailing activated | new SL=${p['stop_price']:,.2f} "
+                    f"| new TP=${p['tp_price']:,.2f}"
+                )
+                return  # skip remaining checks this tick
+
+            # Standard stop / TP while still in Stage 1
+            if price <= p["stop_price"]:
+                crypto_close(symbol, price, reason="ATR stop")
+            elif price >= p["tp_price"]:
+                crypto_close(symbol, price, reason="ATR take profit")
+
+        else:
+            # ── Stage 3: trail stop & TP with remaining half ──
+            # Trail stop = highest - 1×ATR (never move stop backward)
+            new_trail_stop = p["highest_price"] - atr
+            if new_trail_stop > p["stop_price"]:
+                p["stop_price"] = new_trail_stop
+                logging.info(f"  {coin} trailing stop raised to ${p['stop_price']:,.2f}")
+
+            # TP = highest + 1×ATR (keep advancing)
+            new_tp = p["highest_price"] + atr
+            if new_tp > p["tp_price"]:
+                p["tp_price"] = new_tp
+
+            if price <= p["stop_price"]:
+                crypto_close(symbol, price, reason="Trailing stop (remainder)")
+            elif price >= p["tp_price"]:
+                crypto_close(symbol, price, reason="Trailing TP (remainder)")
+
+    # ── SHORT ─────────────────────────────────────────────────────────────────
     elif p["trade_direction"] == "short":
+
+        # Always track new lows
         if price < p["lowest_price"]:
             p["lowest_price"] = price
 
-        # Breakeven trailing for shorts: once price drops 1 ATR below entry, lock in breakeven
-        if atr > 0 and price <= entry - atr and p["stop_price"] > entry:
-            p["stop_price"] = entry
-            logging.info(f"  {coin} breakeven stop locked at ${entry:,.2f}")
+        if not p["half_sold"]:
+            # ── Stage 1: breakeven lock ──
+            if price <= entry - atr and p["stop_price"] > entry:
+                p["stop_price"] = entry
+                logging.info(f"  {coin} breakeven stop locked at ${entry:,.2f}")
 
-        if price >= p["stop_price"]:
-            crypto_close(symbol, price, reason="ATR stop")
-        elif price <= p["tp_price"]:
-            crypto_close(symbol, price, reason="ATR take profit")
+            # ── Stage 2: partial close at 1.5×ATR profit (price dropped 1.5×ATR) ──
+            if price <= entry - 1.5 * atr:
+                partial_price = price
+                crypto_partial_close(symbol, partial_price, reason="Partial TP (1.5×ATR)")
+
+                # Lock stop at entry
+                p["stop_price"] = entry
+                # Advance TP to lowest - 1×ATR
+                p["tp_price"] = p["lowest_price"] - atr
+                logging.info(
+                    f"  {coin} short trailing activated | new SL=${p['stop_price']:,.2f} "
+                    f"| new TP=${p['tp_price']:,.2f}"
+                )
+                return
+
+            if price >= p["stop_price"]:
+                crypto_close(symbol, price, reason="ATR stop")
+            elif price <= p["tp_price"]:
+                crypto_close(symbol, price, reason="ATR take profit")
+
+        else:
+            # ── Stage 3: trail stop & TP (short) ──
+            new_trail_stop = p["lowest_price"] + atr
+            if new_trail_stop < p["stop_price"]:
+                p["stop_price"] = new_trail_stop
+                logging.info(f"  {coin} short trailing stop lowered to ${p['stop_price']:,.2f}")
+
+            new_tp = p["lowest_price"] - atr
+            if new_tp < p["tp_price"]:
+                p["tp_price"] = new_tp
+
+            if price >= p["stop_price"]:
+                crypto_close(symbol, price, reason="Trailing stop (remainder)")
+            elif price <= p["tp_price"]:
+                crypto_close(symbol, price, reason="Trailing TP (remainder)")
 
 
 # ══════════════════════════════════════════════════════════════

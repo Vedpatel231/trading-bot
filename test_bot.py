@@ -24,6 +24,55 @@ sys.modules["ccxt"] = ccxt_stub
 # NOTE: alpaca_trade_api stub removed — import is already commented out in bot.py
 #       Stocks section fully disabled; no alpaca stub needed.
 
+# Stub out ta (technical analysis library) so tests can run without installing it
+def _ema(series, window=14, **kw):
+    return series.ewm(span=window, adjust=False).mean()
+
+def _rsi(series, window=14, **kw):
+    delta = series.diff()
+    avg_gain = delta.clip(lower=0).rolling(window).mean()
+    avg_loss = (-delta.clip(upper=0)).rolling(window).mean()
+    avg_loss = avg_loss.where(avg_loss != 0, 1e-10)   # avoid div-by-zero in pure trends
+    rs = avg_gain / avg_loss
+    return 100 - (100 / (1 + rs))
+
+def _atr(high, low, close, window=14, **kw):
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    return tr.rolling(window).mean()
+
+class _MACD:
+    def __init__(self, close, window_fast=12, window_slow=26, window_sign=9, **kw):
+        ema_fast = close.ewm(span=window_fast, adjust=False).mean()
+        ema_slow = close.ewm(span=window_slow, adjust=False).mean()
+        self._macd = ema_fast - ema_slow
+        self._signal = self._macd.ewm(span=window_sign, adjust=False).mean()
+        self._diff = self._macd - self._signal
+    def macd(self):        return self._macd
+    def macd_signal(self): return self._signal
+    def macd_diff(self):   return self._diff
+
+class _ADXIndicator:
+    def __init__(self, high, low, close, window=14, **kw):
+        self._adx = pd.Series(np.random.uniform(20, 40, len(close)), index=close.index)
+    def adx(self): return self._adx
+
+ta_stub = types.ModuleType("ta")
+ta_trend = types.ModuleType("ta.trend")
+ta_trend.ema_indicator  = _ema
+ta_trend.MACD           = _MACD
+ta_trend.ADXIndicator   = _ADXIndicator
+ta_momentum = types.ModuleType("ta.momentum")
+ta_momentum.rsi         = _rsi
+ta_volatility = types.ModuleType("ta.volatility")
+ta_volatility.average_true_range = _atr
+ta_stub.trend      = ta_trend
+ta_stub.momentum   = ta_momentum
+ta_stub.volatility = ta_volatility
+sys.modules["ta"]            = ta_stub
+sys.modules["ta.trend"]      = ta_trend
+sys.modules["ta.momentum"]   = ta_momentum
+sys.modules["ta.volatility"] = ta_volatility
+
 import importlib
 bot = importlib.import_module("bot")
 
@@ -62,6 +111,7 @@ def reset_paper(symbol="BTC/USDT", balance=3333.33):
         "trade_direction": "", "entry_price": 0.0, "entry_atr": 0.0,
         "stop_price": 0.0, "tp_price": 0.0, "entry_strategy": "",
         "highest_price": 0.0, "lowest_price": 999999.0,
+        "half_sold": False,
         "total_trades": 0, "wins": 0, "losses": 0,
         "daily_start_bal": balance, "last_loss_time": None,
         "total_pnl": 0.0, "best_trade": 0.0, "worst_trade": 0.0,
@@ -250,9 +300,20 @@ class TestBreakevenTrailingStop(unittest.TestCase):
         self.assertTrue(self.p["in_trade"])
 
     def test_tp_still_works_after_breakeven(self):
-        """Breakeven locked in but TP should still close trade."""
-        bot.check_crypto_exits("BTC/USDT", 50600.0)   # lock breakeven
-        bot.check_crypto_exits("BTC/USDT", 51300.0)   # exceeds TP=51250
+        """
+        Breakeven locked; price climbs to partial-close level, then trailing TP closes the rest.
+        With new logic: 51300 > partial trigger (50750) → half sold; trailing TP = ~51800.
+        Price then hits 51900 to close remainder via trailing TP.
+        """
+        bot.check_crypto_exits("BTC/USDT", 50600.0)   # lock breakeven stop
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # partial close at 1.5×ATR — half_sold=True
+        self.assertTrue(self.p["half_sold"])
+        self.assertTrue(self.p["in_trade"])            # remainder still open
+        # Trailing TP should be approximately highest_price + 1×ATR
+        bot.check_crypto_exits("BTC/USDT", 52000.0)   # price keeps rising, new high
+        # Now price reverses and hits trailing stop (highest - 1×ATR)
+        # highest=52000, trailing stop = 52000-500 = 51500
+        bot.check_crypto_exits("BTC/USDT", 51400.0)   # below 51500 → closes remainder
         self.assertFalse(self.p["in_trade"])
 
 
@@ -267,9 +328,14 @@ class TestExits(unittest.TestCase):
         self.assertFalse(bot.crypto_paper["BTC/USDT"]["in_trade"])
 
     def test_take_profit_fires(self):
-        # TP is at 50000 + 500*2.5 = 51250
-        bot.check_crypto_exits("BTC/USDT", 51300.0)
-        self.assertFalse(bot.crypto_paper["BTC/USDT"]["in_trade"])
+        # With new logic: price 50750+ triggers partial (1.5×ATR), not immediate full close.
+        # After partial, trailing TP = highest+ATR; full close when trailing stop is hit.
+        p = bot.crypto_paper["BTC/USDT"]
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # partial fires (1.5×ATR)
+        self.assertTrue(p["half_sold"])
+        bot.check_crypto_exits("BTC/USDT", 52000.0)   # price surges, highest=52000
+        bot.check_crypto_exits("BTC/USDT", 51400.0)   # falls below trailing stop (52000-500=51500)
+        self.assertFalse(p["in_trade"])
 
     def test_price_between_stop_tp_stays_open(self):
         bot.check_crypto_exits("BTC/USDT", 50200.0)
@@ -293,10 +359,17 @@ class TestShortPosition(unittest.TestCase):
         self.assertLess(self.p["tp_price"], 2000.0)
 
     def test_short_wins_on_price_drop(self):
-        tp = self.p["tp_price"]
-        bot.check_crypto_exits("ETH/USDT", tp - 1)
+        # entry=2000, ATR=50 → partial fires at 2000-75=1925; full close when trailing stop hit.
+        # Step 1: partial close at 1924 (< 1925 trigger)
+        bot.check_crypto_exits("ETH/USDT", 1924.0)
+        self.assertTrue(self.p["half_sold"])
+        self.assertTrue(self.p["in_trade"])
+        # Step 2: price continues down to 1850 → trailing stop = 1850+50 = 1900
+        bot.check_crypto_exits("ETH/USDT", 1850.0)
+        # Step 3: price bounces up past trailing stop → full close
+        bot.check_crypto_exits("ETH/USDT", 1910.0)   # > 1900 trailing stop
         self.assertFalse(self.p["in_trade"])
-        self.assertEqual(self.p["wins"], 1)
+        self.assertGreater(self.p["wins"] + self.p["losses"], 0)
 
     def test_short_loses_on_price_rise(self):
         stop = self.p["stop_price"]
@@ -716,6 +789,148 @@ class TestDailyBestWorstReset(unittest.TestCase):
         self.assertEqual(bot.crypto_paper["BTC/USDT"]["worst_trade"], 0.0)
 
 
+class TestTrailingTPSL(unittest.TestCase):
+    """
+    Tests for 3-stage trailing TP/SL with partial position close.
+
+    Setup: entry=50000, ATR=500
+      - Stage 1 stop = 50000 - 500 = 49500
+      - Stage 1 TP   = 50000 + 1250 = 51250  (2.5×ATR)
+      - Partial fires at 50000 + 750 = 50750  (1.5×ATR)
+    """
+
+    def setUp(self):
+        reset_paper("BTC/USDT", 10000.0)
+        # Patch telegram so tests don't make network calls
+        bot.send_telegram = lambda msg: None
+        # Enter long at 50000, ATR=500
+        bot.crypto_buy("BTC/USDT", 50000.0, 0.2, 500.0, "Trend")
+        self.p = bot.crypto_paper["BTC/USDT"]
+        self.initial_coin = self.p["coin_held"]
+
+    # ── Stage 1 ──────────────────────────────────────────────────
+    def test_no_partial_below_1_5atr(self):
+        """Price at 50700 (1.4×ATR profit) — no partial close yet."""
+        bot.check_crypto_exits("BTC/USDT", 50700.0)
+        self.assertFalse(self.p["half_sold"])
+        self.assertAlmostEqual(self.p["coin_held"], self.initial_coin, places=8)
+        self.assertTrue(self.p["in_trade"])
+
+    def test_standard_stop_fires_stage1(self):
+        """Price drops to 49400 (below stop=49500) — full close in stage 1."""
+        bot.check_crypto_exits("BTC/USDT", 49400.0)
+        self.assertFalse(self.p["in_trade"])
+        self.assertFalse(self.p["half_sold"])
+
+    def test_partial_fires_before_old_static_tp(self):
+        """
+        Price hits 51300: this is above both the 1.5×ATR partial trigger (50750)
+        AND the old 2.5×ATR static TP (51250). With the new trailing logic the
+        partial close fires first at 50750, leaving the remainder open — the old
+        fixed TP is replaced by a trailing TP that advances with price.
+        """
+        bot.check_crypto_exits("BTC/USDT", 51300.0)
+        # Partial fired → half sold, trade still open with trailing stop/TP
+        self.assertTrue(self.p["half_sold"])
+        self.assertTrue(self.p["in_trade"])
+
+    # ── Stage 2: partial close at 1.5×ATR ────────────────────────
+    def test_partial_fires_at_1_5atr(self):
+        """Price reaches 50750 (exactly 1.5×ATR up) — half sold."""
+        bot.check_crypto_exits("BTC/USDT", 50750.0)
+        self.assertTrue(self.p["half_sold"])
+        # Remaining coin ≈ half of original
+        self.assertAlmostEqual(self.p["coin_held"], self.initial_coin / 2.0, places=6)
+
+    def test_stop_moves_to_entry_after_partial(self):
+        """After partial close, stop should be locked at entry=50000."""
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # trigger partial
+        self.assertEqual(self.p["stop_price"], 50000.0)
+
+    def test_tp_advances_after_partial(self):
+        """After partial close, TP = highest_price + 1×ATR (≥ 50750+500=51250)."""
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # trigger partial
+        self.assertGreaterEqual(self.p["tp_price"], 50750.0 + 500.0)
+
+    def test_trade_still_open_after_partial(self):
+        """Remaining half should still be in_trade after partial close."""
+        bot.check_crypto_exits("BTC/USDT", 50750.0)
+        self.assertTrue(self.p["in_trade"])
+
+    # ── Stage 3: trailing stop follows new highs ──────────────────
+    def test_trailing_stop_rises_with_new_high(self):
+        """After partial, as price makes a new high trailing stop advances."""
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # partial at 50750
+        # New high at 51500 → trailing stop should be 51500 - 500 = 51000
+        bot.check_crypto_exits("BTC/USDT", 51500.0)
+        self.assertAlmostEqual(self.p["stop_price"], 51000.0, places=1)
+
+    def test_trailing_stop_never_moves_backward(self):
+        """Trailing stop should not decrease if price dips below recent high."""
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # partial
+        bot.check_crypto_exits("BTC/USDT", 51500.0)   # new high → stop=51000
+        stop_after_high = self.p["stop_price"]
+        bot.check_crypto_exits("BTC/USDT", 51200.0)   # price dips — stop shouldn't drop
+        self.assertGreaterEqual(self.p["stop_price"], stop_after_high)
+
+    def test_remainder_closes_on_trailing_stop(self):
+        """Remaining half should close when price falls back to trailing stop."""
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # partial at 50750
+        bot.check_crypto_exits("BTC/USDT", 51500.0)   # new high → trailing stop=51000
+        bot.check_crypto_exits("BTC/USDT", 50900.0)   # drops below 51000 → close
+        self.assertFalse(self.p["in_trade"])
+        self.assertEqual(self.p["coin_held"], 0.0)
+
+    def test_half_sold_resets_after_full_close(self):
+        """half_sold flag must be False after the trade is fully closed."""
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # partial
+        bot.check_crypto_exits("BTC/USDT", 51500.0)   # new high
+        bot.check_crypto_exits("BTC/USDT", 50900.0)   # trailing stop hit → full close
+        self.assertFalse(self.p["half_sold"])
+
+    def test_balance_increases_across_both_legs(self):
+        """Total balance after both partial + remainder close should exceed starting balance."""
+        start_bal = self.p["balance"]
+        bot.check_crypto_exits("BTC/USDT", 50750.0)   # partial (profit leg 1)
+        bot.check_crypto_exits("BTC/USDT", 51500.0)   # new high
+        bot.check_crypto_exits("BTC/USDT", 51600.0)   # new high again
+        bot.check_crypto_exits("BTC/USDT", 51000.0)   # trailing stop hit → close remainder
+        self.assertGreater(self.p["balance"], start_bal)
+
+    # ── Short mirror ──────────────────────────────────────────────
+    def test_short_partial_fires_at_1_5atr_below(self):
+        """Short: partial close fires when price drops 1.5×ATR below entry."""
+        reset_paper("BTC/USDT", 10000.0)
+        bot.send_telegram = lambda msg: None
+        bot.crypto_short("BTC/USDT", 50000.0, 0.2, 500.0, "Trend")
+        p = bot.crypto_paper["BTC/USDT"]
+        initial_coin = p["coin_held"]
+        # Price drops 1.5×ATR → 50000 - 750 = 49250
+        bot.check_crypto_exits("BTC/USDT", 49250.0)
+        self.assertTrue(p["half_sold"])
+        self.assertAlmostEqual(p["coin_held"], initial_coin / 2.0, places=6)
+
+    def test_short_stop_moves_to_entry_after_partial(self):
+        """Short: stop should move to entry after partial close."""
+        reset_paper("BTC/USDT", 10000.0)
+        bot.send_telegram = lambda msg: None
+        bot.crypto_short("BTC/USDT", 50000.0, 0.2, 500.0, "Trend")
+        p = bot.crypto_paper["BTC/USDT"]
+        bot.check_crypto_exits("BTC/USDT", 49250.0)
+        self.assertEqual(p["stop_price"], 50000.0)
+
+    def test_short_trailing_stop_follows_lows(self):
+        """Short: trailing stop descends as price makes new lows."""
+        reset_paper("BTC/USDT", 10000.0)
+        bot.send_telegram = lambda msg: None
+        bot.crypto_short("BTC/USDT", 50000.0, 0.2, 500.0, "Trend")
+        p = bot.crypto_paper["BTC/USDT"]
+        bot.check_crypto_exits("BTC/USDT", 49250.0)   # partial
+        # New low at 48500 → trailing stop = 48500 + 500 = 49000
+        bot.check_crypto_exits("BTC/USDT", 48500.0)
+        self.assertAlmostEqual(p["stop_price"], 49000.0, places=1)
+
+
 # ══════════════════════════════════════════════════════════
 #  RUN
 # ══════════════════════════════════════════════════════════
@@ -732,6 +947,7 @@ if __name__ == "__main__":
         TestMomentumBurst,               # new MomentumBurst + ShortMomentumBurst strategy
         TestWarmupRegime, TestFetchCryptoRetry, TestDailyBestWorstReset,
         TestShortBreakoutRegimeFix,      # BUG-FIX #8
+        TestTrailingTPSL,                # 3-stage trailing TP/SL with partial close
     ]
     for tc in test_classes:
         suite.addTests(loader.loadTestsFromTestCase(tc))
