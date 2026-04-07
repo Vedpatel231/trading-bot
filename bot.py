@@ -8,7 +8,7 @@ import os
 import threading
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from alpaca_trade_api.rest import REST
+# from alpaca_trade_api.rest import REST  # STOCKS DISABLED — uncomment to re-enable
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
@@ -184,6 +184,9 @@ def reset_daily_stats():
         perf["start_bal"] = total_equity
         for symbol in CRYPTO_SYMBOLS:
             crypto_paper[symbol]["daily_start_bal"] = get_crypto_symbol_equity(symbol)
+            # BUG-FIX: reset per-day best/worst so daily report reflects today only
+            crypto_paper[symbol]["best_trade"]  = 0.0
+            crypto_paper[symbol]["worst_trade"] = 0.0
         print(f"[{datetime.now().strftime('%H:%M:%S')}] New day — stats reset. Equity: ${total_equity:,.2f}")
 
 
@@ -220,11 +223,29 @@ def is_trading_allowed(symbol):
 # ══════════════════════════════════════════════════════════════
 
 def fetch_crypto(symbol, tf, limit=250):
-    bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-    df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
-    df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-    df.set_index("ts", inplace=True)
-    return df
+    """Fetch OHLCV candles with retry, dedup, and sort — mirrors backtest robustness."""
+    last_err = None
+    for attempt in range(3):
+        try:
+            bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
+            df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
+            df["ts"] = pd.to_datetime(df["ts"], unit="ms")
+            df.set_index("ts", inplace=True)
+            df = df[~df.index.duplicated(keep="first")].sort_index()
+            return df
+        except Exception as e:
+            last_err = e
+            if attempt < 2:
+                time.sleep(2 ** attempt)   # 1s, then 2s back-off
+    raise RuntimeError(f"fetch_crypto({symbol},{tf}) failed after 3 attempts: {last_err}")
+
+
+def get_live_price(symbol):
+    """Fetch real-time ticker price for accurate intra-candle stop/TP checks."""
+    try:
+        return float(exchange.fetch_ticker(symbol)["last"])
+    except Exception:
+        return None
 
 
 
@@ -348,9 +369,6 @@ def get_crypto_signal(df, regime, prev_regime_state):
     short_pullback = regime["down"] and prev_near_ema_above and rejection_candle and macd_worsening and rsi > 35 and not macro_bull
     short_regimeflip = regime_just_flipped_down and ema_already_below and macd_bearish and rsi > 35 and not macro_bull
 
-    sell_signal = ema_cross_down and macd_bearish
-    cover_signal = ema_cross_up and macd_bullish
-
     if trend_buy:        return {"signal": "BUY",   "strategy": "Trend",           "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
     if breakout_buy:     return {"signal": "BUY",   "strategy": "Breakout",        "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
     if pullback_buy:     return {"signal": "BUY",   "strategy": "Pullback",        "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
@@ -359,8 +377,7 @@ def get_crypto_signal(df, regime, prev_regime_state):
     if short_breakout:   return {"signal": "SHORT", "strategy": "ShortBreakout",   "direction": "short", "price": price, "atr": atr, "rsi": rsi}
     if short_pullback:   return {"signal": "SHORT", "strategy": "ShortPullback",   "direction": "short", "price": price, "atr": atr, "rsi": rsi}
     if short_regimeflip: return {"signal": "SHORT", "strategy": "ShortRegimeFlip", "direction": "short", "price": price, "atr": atr, "rsi": rsi}
-    if sell_signal:      return {"signal": "SELL",  "strategy": "Signal",          "direction": "",      "price": price, "atr": atr, "rsi": rsi}
-    if cover_signal:     return {"signal": "COVER", "strategy": "Signal",          "direction": "",      "price": price, "atr": atr, "rsi": rsi}
+    # NOTE: SELL/COVER signal exits removed — trades close via ATR stop or TP only.
     return {"signal": "HOLD", "strategy": "none", "direction": "", "price": price, "atr": atr, "rsi": rsi}
 
 
@@ -541,13 +558,29 @@ def crypto_close(symbol, price, reason="Signal"):
 
 
 def check_crypto_exits(symbol, price):
+    """
+    Check stop-loss and take-profit for an open position.
+    Uses live ticker price (passed in) for intra-candle accuracy.
+    Also applies breakeven trailing: once trade moves 1 ATR in our favour,
+    the stop is moved up to entry price so a winner can never become a full loss.
+    """
     p = crypto_paper[symbol]
     if not p["in_trade"]:
         return
 
+    entry   = p["entry_price"]
+    atr     = p["entry_atr"]
+    coin    = symbol.split("/")[0]
+
     if p["trade_direction"] == "long":
         if price > p["highest_price"]:
             p["highest_price"] = price
+
+        # Breakeven trailing: once price clears entry + 1 ATR, lock in breakeven
+        if atr > 0 and price >= entry + atr and p["stop_price"] < entry:
+            p["stop_price"] = entry
+            logging.info(f"  {coin} breakeven stop locked at ${entry:,.2f}")
+
         if price <= p["stop_price"]:
             crypto_close(symbol, price, reason="ATR stop")
         elif price >= p["tp_price"]:
@@ -556,6 +589,12 @@ def check_crypto_exits(symbol, price):
     elif p["trade_direction"] == "short":
         if price < p["lowest_price"]:
             p["lowest_price"] = price
+
+        # Breakeven trailing for shorts: once price drops 1 ATR below entry, lock in breakeven
+        if atr > 0 and price <= entry - atr and p["stop_price"] > entry:
+            p["stop_price"] = entry
+            logging.info(f"  {coin} breakeven stop locked at ${entry:,.2f}")
+
         if price >= p["stop_price"]:
             crypto_close(symbol, price, reason="ATR stop")
         elif price <= p["tp_price"]:
@@ -602,10 +641,35 @@ def schedule_daily_report():
 
 
 # ══════════════════════════════════════════════════════════════
+#  REGIME WARMUP  (prevents false RegimeFlip trades on restart)
+# ══════════════════════════════════════════════════════════════
+
+def warmup_regime():
+    """
+    Pre-populate prev_regime with the actual live regime state before the
+    main loop starts.  Without this, every symbol starts as up=False so the
+    very first iteration falsely triggers regime_just_flipped_up for any
+    coin that is already in an UP regime, firing a bad RegimeFlip entry.
+    """
+    print("Warming up regime state...")
+    for symbol in CRYPTO_SYMBOLS:
+        try:
+            regime = get_crypto_regime(symbol)
+            prev_regime[symbol] = {"up": regime["up"], "down": regime["down"]}
+            coin = symbol.split("/")[0]
+            print(f"  {coin}: {regime['label']} | macro_bull={regime['macro_bull']} "
+                  f"| up={regime['up']} | down={regime['down']}")
+        except Exception as e:
+            print(f"  {symbol} warmup failed: {e}")
+    print("Regime warmup complete.\n")
+
+
+# ══════════════════════════════════════════════════════════════
 #  CRYPTO MAIN LOOP
 # ══════════════════════════════════════════════════════════════
 
 def run_crypto():
+    warmup_regime()   # BUG-FIX: pre-populate regime state to avoid false RegimeFlip on restart
     coins = ", ".join(s.split("/")[0] for s in CRYPTO_SYMBOLS)
     msg = (
         f"🤖 <b>Crypto bot started</b>\n"
@@ -639,8 +703,10 @@ def run_crypto():
                     df = add_indicators(fetch_crypto(symbol, CRYPTO_TF, 250))
                     last = df.iloc[-1]
                     price = safe_float(last["close"])
-                    last_seen_prices[symbol] = price
-                    check_crypto_exits(symbol, price)
+                    # BUG-FIX: use live ticker for exits so intra-candle stops fire immediately
+                    live_price = get_live_price(symbol) or price
+                    last_seen_prices[symbol] = live_price
+                    check_crypto_exits(symbol, live_price)
 
                     candle_ts = df.index[-1]
                     if candle_ts == last_candle_ts[symbol]:
@@ -666,19 +732,13 @@ def run_crypto():
                     )
 
                     if not p["in_trade"] and is_trading_allowed(symbol):
+                        # BUG-FIX: removed stale outer Breakout/ShortBreakout guards — all
+                        # entry filters are already enforced inside get_crypto_signal().
                         if sig["signal"] == "BUY":
-                            if sig["strategy"] == "Breakout" and not regime["not_bearish"]:
-                                print("        BUY blocked — regime bearish")
-                            else:
-                                crypto_buy(symbol, sig["price"], sig["rsi"], sig["atr"], sig["strategy"])
+                            crypto_buy(symbol, sig["price"], sig["rsi"], sig["atr"], sig["strategy"])
                         elif sig["signal"] == "SHORT":
-                            if sig["strategy"] == "ShortBreakout" and not regime["not_bullish"]:
-                                print("        SHORT blocked — regime bullish")
-                            else:
-                                crypto_short(symbol, sig["price"], sig["rsi"], sig["atr"], sig["strategy"])
-
-                    # NOTE: Removed SELL/COVER early exits — trades now close via ATR stop or TP only.
-                    # Signal-based exits were triggering prematurely on 30m noise and causing most losses.
+                            crypto_short(symbol, sig["price"], sig["rsi"], sig["atr"], sig["strategy"])
+                    # Trades exit via ATR stop / TP only (check_crypto_exits above).
 
                 except Exception as e:
                     print(f"  {coin} error: {e}")
@@ -899,6 +959,10 @@ def check_stock_exits(symbol, price):
 
 
 def run_stocks():
+    # ── STOCKS DISABLED ── uncomment the return below to re-enable ──────────
+    print("Stocks bot: disabled — crypto-only mode")
+    return
+    # ────────────────────────────────────────────────────────────────────────
     if not ALPACA_KEY or not ALPACA_SECRET:
         print("Stocks bot: No Alpaca keys — skipping")
         return
@@ -999,7 +1063,7 @@ if __name__ == "__main__":
     time.sleep(2)
     threading.Thread(target=run_crypto, daemon=True).start()
     time.sleep(3)
-    threading.Thread(target=run_stocks, daemon=True).start()
+    threading.Thread(target=run_stocks, daemon=True).start()   # exits immediately (stocks disabled)
     time.sleep(1)
     threading.Thread(target=schedule_daily_report, daemon=True).start()
 
