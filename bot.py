@@ -58,7 +58,7 @@ def start_health_server():
 # ══════════════════════════════════════════════════════════════
 
 CRYPTO_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-CRYPTO_TF = "30m"
+CRYPTO_TF = "15m"          # FIX: was "30m" — 15m catches momentum bursts 1-2 candles earlier
 CRYPTO_HTF = "4h"
 FAST_EMA = 7
 SLOW_EMA = 18
@@ -69,23 +69,26 @@ MACD_SIGNAL = 9
 ATR_PERIOD = 14
 CRYPTO_BAL = 10000.0
 RISK = 0.02
-CHECK_INTERVAL = 60 * 3
+CHECK_INTERVAL = 60 * 2   # 2-min polling (was 3 min) — faster reaction on 15m candles
 
 # crypto strategy / risk params
-CRYPTO_STOP_ATR = 1.2
+CRYPTO_STOP_ATR = 1.0     # was 1.2 — tighter stop on 15m; ATR is smaller so keeps same $ risk
 CRYPTO_TP_ATR = 2.5
 BREAKOUT_LOOKBACK = 10
 BREAKOUT_VOL_MULT = 1.5
 STRONG_BODY_MULT = 1.2
 REGIME_MIN_ATR_PCT = 0.002
 PULLBACK_BUFFER = 0.003
-COOLDOWN_MINUTES = 30
+COOLDOWN_MINUTES = 45     # was 30 — more breathing room after each loss
 DAILY_LOSS_LIMIT = 0.03
 
-# Trading fees (Coinbase Advanced tier 1: maker 0.40%, taker 0.60%)
-# Using taker fee since bot uses market orders
-# Change these when you move to a different exchange or tier
-TRADING_FEE_PCT = 0.006   # 0.60% taker fee per trade (Coinbase Advanced default)
+# NEW: trend-quality filters
+ADX_MIN = 23              # ADX must be above this for any entry (below = choppy/ranging market)
+CHOP_RANGE_MIN = 0.004    # 3-candle price range / close must exceed 0.4% (eliminates sideways)
+
+# Trading fees — exchange is ccxt.binanceus() → Binance US taker fee is 0.10%
+# FIX: was 0.006 (0.60% Coinbase rate) — 6× too high for Binance US
+TRADING_FEE_PCT = 0.001   # 0.10% taker fee per trade (Binance US standard)
 # Other exchanges for reference:
 #   Binance US:  0.001 (0.10% maker/taker)
 #   Coinbase T1: 0.006 (0.60% taker) / 0.004 (0.40% maker)
@@ -254,6 +257,7 @@ def add_indicators(df):
     df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=FAST_EMA)
     df["ema_slow"] = ta.trend.ema_indicator(df["close"], window=SLOW_EMA)
     df["rsi"] = ta.momentum.rsi(df["close"], window=RSI_PERIOD)
+    df["rsi_prev"] = df["rsi"].shift(1)   # NEW: previous-bar RSI for crossover detection
 
     macd = ta.trend.MACD(
         df["close"], window_fast=MACD_FAST, window_slow=MACD_SLOW, window_sign=MACD_SIGNAL
@@ -264,6 +268,23 @@ def add_indicators(df):
 
     df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=ATR_PERIOD)
     df["atr_pct"] = df["atr"] / df["close"]
+
+    # NEW: ADX — trend strength filter; ADX < ADX_MIN = choppy/ranging market, skip entries
+    adx_ind = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14)
+    df["adx"] = adx_ind.adx()
+
+    # NEW: rolling VWAP (20-candle window) — approximates intraday institutional fair value
+    # On 15m, 20 candles = 5h of price action; used as bull/bear bias gate for MomentumBurst
+    df["typical_price"] = (df["high"] + df["low"] + df["close"]) / 3
+    df["vwap"] = (
+        (df["typical_price"] * df["volume"]).rolling(20).sum()
+        / df["volume"].rolling(20).sum()
+    )
+
+    # NEW: choppiness metric — 3-candle price range / close; low value = sideways market
+    df["chop_range"] = (
+        df["high"].rolling(3).max() - df["low"].rolling(3).min()
+    ) / df["close"]
 
     df["vol_avg"] = df["volume"].rolling(20).mean()
     df["vol_spike"] = df["volume"] > df["vol_avg"] * BREAKOUT_VOL_MULT
@@ -332,6 +353,16 @@ def get_crypto_signal(df, regime, prev_regime_state):
     price = safe_float(last["close"])
     atr = safe_float(last["atr"])
     rsi = safe_float(last["rsi"], 50.0)
+    rsi_prev = safe_float(last["rsi_prev"], 50.0)
+
+    # ── Trend-quality gates (NEW) ─────────────────────────────────────────────
+    adx = safe_float(last["adx"], 0.0)
+    adx_strong = adx >= ADX_MIN                     # below = choppy/ranging, reject all entries
+    vwap = safe_float(last["vwap"])
+    price_above_vwap = price > vwap and vwap > 0    # institutional fair-value bias
+    price_below_vwap = price < vwap and vwap > 0
+    chop = safe_float(last["chop_range"], 1.0)
+    not_choppy = chop >= CHOP_RANGE_MIN             # 3-candle range must show meaningful movement
 
     ema_cross_up = safe_float(prev["ema_fast"]) < safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) > safe_float(last["ema_slow"])
     ema_cross_down = safe_float(prev["ema_fast"]) > safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) < safe_float(last["ema_slow"])
@@ -345,30 +376,61 @@ def get_crypto_signal(df, regime, prev_regime_state):
 
     regime_just_flipped_up = regime["up"] and not prev_regime_state.get("up", False)
     regime_just_flipped_down = regime["down"] and not prev_regime_state.get("down", False)
+    macro_bull = regime.get("macro_bull", True)
+
+    # ══ MOMENTUM BURST (NEW — earliest entry, 1-2 candles before EMA crossover) ═
+    # LONG burst: RSI was oversold (< 42), now crossing up through 52+, confirmed by
+    # price crossing above rolling VWAP with a volume spike.  This fires while EMA
+    # lines are still converging, capturing the bulk of the $500-1500 BTC impulse.
+    momentum_burst_buy = (
+        rsi_prev < 42 and rsi >= 52           # RSI escaping oversold territory
+        and price_above_vwap                  # price just crossed above institutional fair value
+        and bool(last["vol_spike"])           # volume confirming real participation
+        and adx_strong and not_choppy         # market actually trending, not ranging
+        and regime["up"]                      # 4h HTF regime confirms bull direction
+        and rsi < 68                          # not already overbought
+    )
+    # SHORT burst: RSI was overbought (> 58), now crossing down through 48-, price
+    # below VWAP.  Symmetric mirror of momentum_burst_buy.
+    momentum_burst_short = (
+        rsi_prev > 58 and rsi <= 48           # RSI escaping overbought territory
+        and price_below_vwap                  # price just crossed below institutional fair value
+        and bool(last["vol_spike"])
+        and adx_strong and not_choppy
+        and regime["down"]                    # 4h HTF regime confirms bear direction
+        and rsi > 32
+        and not macro_bull
+    )
 
     # ══ BULLISH (LONG) ════════════════════════════════
+    # All legacy signals now also require adx_strong + not_choppy to filter ranging markets.
     # RSI < 65: avoid entering longs in overbought conditions
-    trend_buy = ema_cross_up and macd_bullish and regime["up"] and rsi < 65
-    # Breakout now requires regime["up"] (was regime["not_bearish"]) — stronger filter
+    trend_buy = ema_cross_up and macd_bullish and regime["up"] and rsi < 65 and adx_strong and not_choppy
+    # Breakout requires regime["up"] — stronger filter vs old regime["not_bearish"]
     breakout_buy = (price > safe_float(last["recent_high"]) and bool(last["strong_bullish"])
-                    and bool(last["vol_spike"]) and regime["up"] and rsi < 65)
+                    and bool(last["vol_spike"]) and regime["up"] and rsi < 65
+                    and adx_strong and not_choppy)
     prev_near_ema = safe_float(prev["close"]) <= safe_float(prev["ema_fast"]) * (1 + PULLBACK_BUFFER)
     rebound_candle = bool(last["bullish_candle"]) and price > safe_float(last["ema_fast"]) and price > safe_float(prev["high"])
-    pullback_buy = regime["up"] and prev_near_ema and rebound_candle and macd_improving and rsi < 65
-    regimeflip_buy = regime_just_flipped_up and ema_already_above and macd_bullish and rsi < 65
+    pullback_buy = regime["up"] and prev_near_ema and rebound_candle and macd_improving and rsi < 65 and adx_strong and not_choppy
+    regimeflip_buy = regime_just_flipped_up and ema_already_above and macd_bullish and rsi < 65 and adx_strong
 
     # ══ BEARISH (SHORT) ═══════════════════════════════
-    # macro_bull: if price is above 200-bar EMA on the HTF, we are in a bull market — skip shorts entirely
-    macro_bull = regime.get("macro_bull", True)
+    # macro_bull: price above 200-bar 4h EMA = sustained uptrend → block all shorts
     # RSI > 35: avoid entering shorts in oversold conditions
-    short_trend = ema_cross_down and macd_bearish and regime["down"] and rsi > 35 and not macro_bull
+    short_trend = ema_cross_down and macd_bearish and regime["down"] and rsi > 35 and not macro_bull and adx_strong and not_choppy
+    # BUG-FIX #8: requires regime["down"] not regime["not_bullish"] for symmetry with breakout_buy
     short_breakout = (price < safe_float(last["recent_low"]) and bool(last["strong_bearish"])
-                      and bool(last["vol_spike"]) and regime["not_bullish"] and rsi > 35 and not macro_bull)
+                      and bool(last["vol_spike"]) and regime["down"] and rsi > 35
+                      and not macro_bull and adx_strong and not_choppy)
     prev_near_ema_above = safe_float(prev["close"]) >= safe_float(prev["ema_fast"]) * (1 - PULLBACK_BUFFER)
     rejection_candle = bool(last["bearish_candle"]) and price < safe_float(last["ema_fast"]) and price < safe_float(prev["low"])
-    short_pullback = regime["down"] and prev_near_ema_above and rejection_candle and macd_worsening and rsi > 35 and not macro_bull
-    short_regimeflip = regime_just_flipped_down and ema_already_below and macd_bearish and rsi > 35 and not macro_bull
+    short_pullback = regime["down"] and prev_near_ema_above and rejection_candle and macd_worsening and rsi > 35 and not macro_bull and adx_strong and not_choppy
+    short_regimeflip = regime_just_flipped_down and ema_already_below and macd_bearish and rsi > 35 and not macro_bull and adx_strong
 
+    # MomentumBurst has priority — it fires earliest in the move (before EMA crossover)
+    if momentum_burst_buy:   return {"signal": "BUY",   "strategy": "MomentumBurst",      "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
+    if momentum_burst_short: return {"signal": "SHORT", "strategy": "ShortMomentumBurst", "direction": "short", "price": price, "atr": atr, "rsi": rsi}
     if trend_buy:        return {"signal": "BUY",   "strategy": "Trend",           "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
     if breakout_buy:     return {"signal": "BUY",   "strategy": "Breakout",        "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
     if pullback_buy:     return {"signal": "BUY",   "strategy": "Pullback",        "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
@@ -675,10 +737,11 @@ def run_crypto():
         f"🤖 <b>Crypto bot started</b>\n"
         f"Coins:     {coins}\n"
         f"Timeframe: {CRYPTO_TF}  |  HTF: {CRYPTO_HTF}\n"
-        f"Long:      Trend + Breakout + Pullback + RegimeFlip\n"
-        f"Short:     ShortTrend + ShortBreakout + ShortPullback + ShortRegimeFlip\n"
+        f"Long:      MomentumBurst + Trend + Breakout + Pullback + RegimeFlip\n"
+        f"Short:     ShortMomentumBurst + ShortTrend + ShortBreakout + ShortPullback + ShortRegimeFlip\n"
         f"Risk:      Stop {CRYPTO_STOP_ATR} ATR | TP {CRYPTO_TP_ATR} ATR\n"
-        f"Fee:       {TRADING_FEE_PCT*100:.1f}% per trade (Coinbase taker)\n"
+        f"Filters:   ADX≥{ADX_MIN} | Chop≥{CHOP_RANGE_MIN*100:.1f}% | VWAP-bias | macro_bull shorts block\n"
+        f"Fee:       {TRADING_FEE_PCT*100:.2f}% per trade (Binance US taker)\n"
         f"Daily limit: {DAILY_LOSS_LIMIT*100:.0f}%  |  Cooldown: {COOLDOWN_MINUTES}min\n"
         f"Balance:   ${CRYPTO_BAL:,.2f}  (paper)"
     )
@@ -750,306 +813,271 @@ def run_crypto():
 
 
 # ══════════════════════════════════════════════════════════════
-#  STOCKS SETTINGS
+#  STOCKS SETTINGS  ── DISABLED (commented out, logic preserved)
 # ══════════════════════════════════════════════════════════════
 
-STOCK_SYMBOLS = ["SPY", "QQQ", "TSLA", "NVDA", "AMD"]
-S_FAST_EMA = 10
-S_SLOW_EMA = 50
-STOCK_BAL = 10000.0
-STOCK_SLEEP = 60 * 5
-MARKET_OPEN_AVOID_MINS = 0
-STOCK_STOP_ATR = 1.2
-STOCK_TP_ATR = 2.5
-STOCK_PULLBACK_BUFFER = 0.003
-
-ALPACA_KEY = os.getenv("ALPACA_API_KEY", "")
-ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "")
-ALPACA_URL = "https://paper-api.alpaca.markets"
-
-stock_paper = {
-    s: {
-        "balance": STOCK_BAL / len(STOCK_SYMBOLS),
-        "shares_held": 0.0,
-        "in_trade": False,
-        "entry_price": 0.0,
-        "entry_atr": 0.0,
-        "stop_price": 0.0,
-        "tp_price": 0.0,
-        "entry_strategy": "",
-        "highest_price": 0.0,
-        "total_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "last_loss_time": None,
-        "total_pnl": 0.0,
-    }
-    for s in STOCK_SYMBOLS
-}
+# STOCK_SYMBOLS = ["SPY", "QQQ", "TSLA", "NVDA", "AMD"]
+# S_FAST_EMA = 10
+# S_SLOW_EMA = 50
+# STOCK_BAL = 10000.0
+# STOCK_SLEEP = 60 * 5
+# MARKET_OPEN_AVOID_MINS = 0
+# STOCK_STOP_ATR = 1.2
+# STOCK_TP_ATR = 2.5
+# STOCK_PULLBACK_BUFFER = 0.003
+#
+# ALPACA_KEY = os.getenv("ALPACA_API_KEY", "")
+# ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "")
+# ALPACA_URL = "https://paper-api.alpaca.markets"
+#
+# stock_paper = {
+#     s: {
+#         "balance": STOCK_BAL / len(STOCK_SYMBOLS),
+#         "shares_held": 0.0,
+#         "in_trade": False,
+#         "entry_price": 0.0,
+#         "entry_atr": 0.0,
+#         "stop_price": 0.0,
+#         "tp_price": 0.0,
+#         "entry_strategy": "",
+#         "highest_price": 0.0,
+#         "total_trades": 0,
+#         "wins": 0,
+#         "losses": 0,
+#         "last_loss_time": None,
+#         "total_pnl": 0.0,
+#     }
+#     for s in STOCK_SYMBOLS
+# }
 
 
 # ══════════════════════════════════════════════════════════════
-#  STOCKS FUNCTIONS
+#  STOCKS FUNCTIONS  ── DISABLED (commented out, logic preserved)
 # ══════════════════════════════════════════════════════════════
 
-def is_safe_trading_time(alpaca):
-    try:
-        clock = alpaca.get_clock()
-        if not clock.is_open:
-            return False
-        now = pd.Timestamp(clock.timestamp).tz_convert("America/New_York")
-        market_open = now.replace(hour=9, minute=30, second=0)
-        market_close = now.replace(hour=16, minute=0, second=0)
-        avoid_open = market_open + timedelta(minutes=MARKET_OPEN_AVOID_MINS)
-        avoid_close = market_close - timedelta(minutes=MARKET_OPEN_AVOID_MINS)
-        if now < avoid_open:
-            print(f"  Time filter: too close to open ({MARKET_OPEN_AVOID_MINS}min buffer)")
-            return False
-        if now > avoid_close:
-            print(f"  Time filter: too close to close ({MARKET_OPEN_AVOID_MINS}min buffer)")
-            return False
-        return True
-    except Exception:
-        return True
-
-
-
-def add_stock_indicators(bars):
-    bars = bars.copy()
-    bars["ema_fast"] = ta.trend.ema_indicator(bars["close"], window=S_FAST_EMA)
-    bars["ema_slow"] = ta.trend.ema_indicator(bars["close"], window=S_SLOW_EMA)
-    bars["ema_200"] = ta.trend.ema_indicator(bars["close"], window=200)
-    bars["atr"] = ta.volatility.average_true_range(bars["high"], bars["low"], bars["close"], window=ATR_PERIOD)
-    bars["body"] = (bars["close"] - bars["open"]).abs()
-    bars["bullish_candle"] = bars["close"] > bars["open"]
-    bars["body_avg"] = bars["body"].rolling(20).mean()
-
-    macd = ta.trend.MACD(bars["close"], window_fast=12, window_slow=26, window_sign=9)
-    bars["macd"] = macd.macd()
-    bars["macd_signal"] = macd.macd_signal()
-    bars["macd_hist"] = macd.macd_diff()
-    return bars
-
-
-
-def stock_regime(last, prev):
-    above_200 = safe_float(last["close"]) > safe_float(last["ema_200"])
-    ema200_rising = safe_float(last["ema_200"]) > safe_float(prev["ema_200"])
-    return {"up": above_200 and ema200_rising, "label": "UP" if above_200 else "DOWN", "ema200_rising": ema200_rising}
-
-
-
-def get_stock_signal(bars):
-    prev = bars.iloc[-2]
-    last = bars.iloc[-1]
-    regime = stock_regime(last, prev)
-
-    ema_cross_up = safe_float(prev["ema_fast"]) < safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) > safe_float(last["ema_slow"])
-    ema_cross_down = safe_float(prev["ema_fast"]) > safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) < safe_float(last["ema_slow"])
-    macd_bullish = safe_float(last["macd_hist"]) > 0
-    macd_bearish = safe_float(last["macd_hist"]) < 0
-    macd_improving = safe_float(last["macd_hist"]) > safe_float(prev["macd_hist"])
-
-    trend_buy = ema_cross_up and macd_bullish and regime["up"]
-
-    prev_near_ema = safe_float(prev["close"]) <= safe_float(prev["ema_fast"]) * (1 + STOCK_PULLBACK_BUFFER)
-    rebound_candle = bool(last["bullish_candle"]) and safe_float(last["close"]) > safe_float(last["ema_fast"]) and safe_float(last["close"]) > safe_float(prev["high"])
-    pullback_buy = regime["up"] and prev_near_ema and rebound_candle and macd_improving
-
-    sell_signal = ema_cross_down and macd_bearish
-
-    if trend_buy:
-        return "BUY", "Trend", regime
-    if pullback_buy:
-        return "BUY", "Pullback", regime
-    if sell_signal:
-        return "SELL", "Signal", regime
-    return "HOLD", "none", regime
-
-
-
-def s_buy(symbol, price, atr, strategy):
-    p = stock_paper[symbol]
-    if p["in_trade"]:
-        return
-    spend = calc_position_size(p["balance"], price, atr, STOCK_STOP_ATR)
-    if spend < 1.0 or spend > p["balance"]:
-        return
-    shares = spend / price
-    stop_price = price - (atr * STOCK_STOP_ATR) if atr > 0 else price * 0.99
-    tp_price = price + (atr * STOCK_TP_ATR) if atr > 0 else price * 1.02
-
-    p["balance"] -= spend
-    p["shares_held"] = shares
-    p["in_trade"] = True
-    p["entry_price"] = price
-    p["entry_atr"] = atr
-    p["stop_price"] = stop_price
-    p["tp_price"] = tp_price
-    p["entry_strategy"] = strategy
-    p["highest_price"] = price
-
-    msg = (
-        f"🟢 <b>BUY {symbol}</b>\n"
-        f"Strategy: {strategy}\n"
-        f"Price:   ${price:,.2f}\n"
-        f"Spent:   ${spend:.2f}\n"
-        f"Shares:  {shares:.4f}\n"
-        f"Balance: ${p['balance']:,.2f}\n"
-        f"Stop: ${stop_price:,.2f} | TP: ${tp_price:,.2f}"
-    )
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
-    send_telegram(msg)
-
-
-
-def s_sell(symbol, price, reason="Signal"):
-    p = stock_paper[symbol]
-    if not p["in_trade"]:
-        return
-    proceeds = p["shares_held"] * price
-    pnl = proceeds - (p["shares_held"] * p["entry_price"])
-    p["balance"] += proceeds
-    p["total_trades"] += 1
-    p["total_pnl"] += pnl
-    p["shares_held"] = 0.0
-    p["in_trade"] = False
-    p["highest_price"] = 0.0
-    p["entry_price"] = 0.0
-    p["entry_atr"] = 0.0
-    p["stop_price"] = 0.0
-    p["tp_price"] = 0.0
-    p["entry_strategy"] = ""
-
-    if pnl >= 0:
-        p["wins"] += 1
-        emoji = "✅"
-        res = f"WIN  +${pnl:.2f}"
-    else:
-        p["losses"] += 1
-        p["last_loss_time"] = datetime.now()
-        emoji = "❌"
-        res = f"LOSS -${abs(pnl):.2f}"
-
-    wr = (p["wins"] / p["total_trades"] * 100) if p["total_trades"] > 0 else 0
-    msg = (
-        f"{emoji} <b>SELL {symbol}</b> ({reason})\n"
-        f"Price:    ${price:,.2f}\n"
-        f"Result:   {res}\n"
-        f"Balance:  ${p['balance']:,.2f}\n"
-        f"Win rate: {wr:.1f}% ({p['wins']}W/{p['losses']}L)\n"
-        f"Total P&L: ${p['total_pnl']:+.2f}"
-    )
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
-    send_telegram(msg)
-
-
-
-def check_stock_exits(symbol, price):
-    p = stock_paper[symbol]
-    if not p["in_trade"]:
-        return
-    if price > p["highest_price"]:
-        p["highest_price"] = price
-    if price <= p["stop_price"]:
-        s_sell(symbol, price, "ATR stop")
-    elif price >= p["tp_price"]:
-        s_sell(symbol, price, "ATR take profit")
-
-
-
-def run_stocks():
-    # ── STOCKS DISABLED ── uncomment the return below to re-enable ──────────
-    print("Stocks bot: disabled — crypto-only mode")
-    return
-    # ────────────────────────────────────────────────────────────────────────
-    if not ALPACA_KEY or not ALPACA_SECRET:
-        print("Stocks bot: No Alpaca keys — skipping")
-        return
-    try:
-        alpaca = REST(ALPACA_KEY, ALPACA_SECRET, ALPACA_URL)
-        alpaca.get_account()
-        print("Stocks bot: Alpaca connected!")
-    except Exception as e:
-        print(f"Stocks bot: connection failed — {e}")
-        return
-
-    msg = (
-        f"📈 <b>Stocks bot started</b>\n"
-        f"Stocks:   {', '.join(STOCK_SYMBOLS)}\n"
-        f"Modes:    Trend + Pullback\n"
-        f"Risk:     Stop {STOCK_STOP_ATR} ATR | TP {STOCK_TP_ATR} ATR\n"
-        f"Time filter: avoid first/last {MARKET_OPEN_AVOID_MINS}min\n"
-        f"Cooldown: {COOLDOWN_MINUTES}min after loss\n"
-        f"Balance:  ${STOCK_BAL:,.2f}  (paper)"
-    )
-    print("=" * 58)
-    print(msg.replace("<b>", "").replace("</b>", ""))
-    print("=" * 58)
-    send_telegram(msg)
-
-    while True:
-        try:
-            clock = alpaca.get_clock()
-            if not clock.is_open:
-                now = pd.Timestamp(clock.timestamp)
-                nxt = pd.Timestamp(clock.next_open)
-                mins = int((nxt - now).total_seconds() / 60)
-                print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — {mins} min until open")
-                time.sleep(60 * 15)
-                continue
-
-            if not is_safe_trading_time(alpaca):
-                time.sleep(60)
-                continue
-
-            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Market open — checking stocks...")
-
-            import yfinance as yf
-
-            for symbol in STOCK_SYMBOLS:
-                try:
-                    bars = yf.Ticker(symbol).history(period="2y", interval="1d")
-                    bars = bars.reset_index(drop=True)
-                    bars.columns = [c.lower() for c in bars.columns]
-                    if len(bars) < 220:
-                        print(f"  {symbol:<4} | not enough bars — skipping")
-                        continue
-
-                    bars = add_stock_indicators(bars)
-                    prev = bars.iloc[-2]
-                    last = bars.iloc[-1]
-                    price = safe_float(last["close"])
-                    atr = safe_float(last["atr"])
-                    signal, strategy, regime = get_stock_signal(bars)
-                    p = stock_paper[symbol]
-                    status = "IN TRADE" if p["in_trade"] else "watching"
-                    macd_dir = "↑" if safe_float(last["macd_hist"]) > 0 else "↓"
-
-                    check_stock_exits(symbol, price)
-
-                    can_trade = True
-                    if p["last_loss_time"]:
-                        elapsed = (datetime.now() - p["last_loss_time"]).total_seconds() / 60
-                        if elapsed < COOLDOWN_MINUTES:
-                            can_trade = False
-
-                    print(
-                        f"  {symbol:<4} | {signal:<4} | {strategy:<8} | "
-                        f"200:{regime['label']:<4} | MACD:{macd_dir} | ${price:>8,.2f} | {status}"
-                    )
-
-                    if signal == "BUY" and not p["in_trade"] and can_trade:
-                        s_buy(symbol, price, atr, strategy)
-                    elif signal == "SELL" and p["in_trade"]:
-                        s_sell(symbol, price)
-
-                    time.sleep(1)
-                except Exception as e:
-                    print(f"  {symbol} error: {e}")
-        except Exception as e:
-            print(f"Stocks loop error: {e}")
-        time.sleep(STOCK_SLEEP)
+# def is_safe_trading_time(alpaca):
+#     try:
+#         clock = alpaca.get_clock()
+#         if not clock.is_open:
+#             return False
+#         now = pd.Timestamp(clock.timestamp).tz_convert("America/New_York")
+#         market_open = now.replace(hour=9, minute=30, second=0)
+#         market_close = now.replace(hour=16, minute=0, second=0)
+#         avoid_open = market_open + timedelta(minutes=MARKET_OPEN_AVOID_MINS)
+#         avoid_close = market_close - timedelta(minutes=MARKET_OPEN_AVOID_MINS)
+#         if now < avoid_open:
+#             print(f"  Time filter: too close to open ({MARKET_OPEN_AVOID_MINS}min buffer)")
+#             return False
+#         if now > avoid_close:
+#             print(f"  Time filter: too close to close ({MARKET_OPEN_AVOID_MINS}min buffer)")
+#             return False
+#         return True
+#     except Exception:
+#         return True
+#
+#
+# def add_stock_indicators(bars):
+#     bars = bars.copy()
+#     bars["ema_fast"] = ta.trend.ema_indicator(bars["close"], window=S_FAST_EMA)
+#     bars["ema_slow"] = ta.trend.ema_indicator(bars["close"], window=S_SLOW_EMA)
+#     bars["ema_200"] = ta.trend.ema_indicator(bars["close"], window=200)
+#     bars["atr"] = ta.volatility.average_true_range(bars["high"], bars["low"], bars["close"], window=ATR_PERIOD)
+#     bars["body"] = (bars["close"] - bars["open"]).abs()
+#     bars["bullish_candle"] = bars["close"] > bars["open"]
+#     bars["body_avg"] = bars["body"].rolling(20).mean()
+#     macd = ta.trend.MACD(bars["close"], window_fast=12, window_slow=26, window_sign=9)
+#     bars["macd"] = macd.macd()
+#     bars["macd_signal"] = macd.macd_signal()
+#     bars["macd_hist"] = macd.macd_diff()
+#     return bars
+#
+#
+# def stock_regime(last, prev):
+#     above_200 = safe_float(last["close"]) > safe_float(last["ema_200"])
+#     ema200_rising = safe_float(last["ema_200"]) > safe_float(prev["ema_200"])
+#     return {"up": above_200 and ema200_rising, "label": "UP" if above_200 else "DOWN", "ema200_rising": ema200_rising}
+#
+#
+# def get_stock_signal(bars):
+#     prev = bars.iloc[-2]
+#     last = bars.iloc[-1]
+#     regime = stock_regime(last, prev)
+#     ema_cross_up = safe_float(prev["ema_fast"]) < safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) > safe_float(last["ema_slow"])
+#     ema_cross_down = safe_float(prev["ema_fast"]) > safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) < safe_float(last["ema_slow"])
+#     macd_bullish = safe_float(last["macd_hist"]) > 0
+#     macd_bearish = safe_float(last["macd_hist"]) < 0
+#     macd_improving = safe_float(last["macd_hist"]) > safe_float(prev["macd_hist"])
+#     trend_buy = ema_cross_up and macd_bullish and regime["up"]
+#     prev_near_ema = safe_float(prev["close"]) <= safe_float(prev["ema_fast"]) * (1 + STOCK_PULLBACK_BUFFER)
+#     rebound_candle = bool(last["bullish_candle"]) and safe_float(last["close"]) > safe_float(last["ema_fast"]) and safe_float(last["close"]) > safe_float(prev["high"])
+#     pullback_buy = regime["up"] and prev_near_ema and rebound_candle and macd_improving
+#     sell_signal = ema_cross_down and macd_bearish
+#     if trend_buy:    return "BUY",  "Trend",   regime
+#     if pullback_buy: return "BUY",  "Pullback", regime
+#     if sell_signal:  return "SELL", "Signal",   regime
+#     return "HOLD", "none", regime
+#
+#
+# def s_buy(symbol, price, atr, strategy):
+#     p = stock_paper[symbol]
+#     if p["in_trade"]:
+#         return
+#     spend = calc_position_size(p["balance"], price, atr, STOCK_STOP_ATR)
+#     if spend < 1.0 or spend > p["balance"]:
+#         return
+#     shares = spend / price
+#     stop_price = price - (atr * STOCK_STOP_ATR) if atr > 0 else price * 0.99
+#     tp_price = price + (atr * STOCK_TP_ATR) if atr > 0 else price * 1.02
+#     p["balance"] -= spend
+#     p["shares_held"] = shares
+#     p["in_trade"] = True
+#     p["entry_price"] = price
+#     p["entry_atr"] = atr
+#     p["stop_price"] = stop_price
+#     p["tp_price"] = tp_price
+#     p["entry_strategy"] = strategy
+#     p["highest_price"] = price
+#     msg = (
+#         f"🟢 <b>BUY {symbol}</b>\n"
+#         f"Strategy: {strategy}\n"
+#         f"Price:   ${price:,.2f}\n"
+#         f"Spent:   ${spend:.2f}\n"
+#         f"Shares:  {shares:.4f}\n"
+#         f"Balance: ${p['balance']:,.2f}\n"
+#         f"Stop: ${stop_price:,.2f} | TP: ${tp_price:,.2f}"
+#     )
+#     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
+#     send_telegram(msg)
+#
+#
+# def s_sell(symbol, price, reason="Signal"):
+#     p = stock_paper[symbol]
+#     if not p["in_trade"]:
+#         return
+#     proceeds = p["shares_held"] * price
+#     pnl = proceeds - (p["shares_held"] * p["entry_price"])
+#     p["balance"] += proceeds
+#     p["total_trades"] += 1
+#     p["total_pnl"] += pnl
+#     p["shares_held"] = 0.0
+#     p["in_trade"] = False
+#     p["highest_price"] = 0.0
+#     p["entry_price"] = 0.0
+#     p["entry_atr"] = 0.0
+#     p["stop_price"] = 0.0
+#     p["tp_price"] = 0.0
+#     p["entry_strategy"] = ""
+#     if pnl >= 0:
+#         p["wins"] += 1
+#         emoji = "✅"
+#         res = f"WIN  +${pnl:.2f}"
+#     else:
+#         p["losses"] += 1
+#         p["last_loss_time"] = datetime.now()
+#         emoji = "❌"
+#         res = f"LOSS -${abs(pnl):.2f}"
+#     wr = (p["wins"] / p["total_trades"] * 100) if p["total_trades"] > 0 else 0
+#     msg = (
+#         f"{emoji} <b>SELL {symbol}</b> ({reason})\n"
+#         f"Price:    ${price:,.2f}\n"
+#         f"Result:   {res}\n"
+#         f"Balance:  ${p['balance']:,.2f}\n"
+#         f"Win rate: {wr:.1f}% ({p['wins']}W/{p['losses']}L)\n"
+#         f"Total P&L: ${p['total_pnl']:+.2f}"
+#     )
+#     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
+#     send_telegram(msg)
+#
+#
+# def check_stock_exits(symbol, price):
+#     p = stock_paper[symbol]
+#     if not p["in_trade"]:
+#         return
+#     if price > p["highest_price"]:
+#         p["highest_price"] = price
+#     if price <= p["stop_price"]:
+#         s_sell(symbol, price, "ATR stop")
+#     elif price >= p["tp_price"]:
+#         s_sell(symbol, price, "ATR take profit")
+#
+#
+# def run_stocks():
+#     # To re-enable stocks: uncomment this entire function block and the thread in __main__
+#     if not ALPACA_KEY or not ALPACA_SECRET:
+#         print("Stocks bot: No Alpaca keys — skipping")
+#         return
+#     try:
+#         alpaca = REST(ALPACA_KEY, ALPACA_SECRET, ALPACA_URL)
+#         alpaca.get_account()
+#         print("Stocks bot: Alpaca connected!")
+#     except Exception as e:
+#         print(f"Stocks bot: connection failed — {e}")
+#         return
+#     msg = (
+#         f"📈 <b>Stocks bot started</b>\n"
+#         f"Stocks:   {', '.join(STOCK_SYMBOLS)}\n"
+#         f"Modes:    Trend + Pullback\n"
+#         f"Risk:     Stop {STOCK_STOP_ATR} ATR | TP {STOCK_TP_ATR} ATR\n"
+#         f"Time filter: avoid first/last {MARKET_OPEN_AVOID_MINS}min\n"
+#         f"Cooldown: {COOLDOWN_MINUTES}min after loss\n"
+#         f"Balance:  ${STOCK_BAL:,.2f}  (paper)"
+#     )
+#     print("=" * 58)
+#     print(msg.replace("<b>", "").replace("</b>", ""))
+#     print("=" * 58)
+#     send_telegram(msg)
+#     while True:
+#         try:
+#             clock = alpaca.get_clock()
+#             if not clock.is_open:
+#                 now = pd.Timestamp(clock.timestamp)
+#                 nxt = pd.Timestamp(clock.next_open)
+#                 mins = int((nxt - now).total_seconds() / 60)
+#                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — {mins} min until open")
+#                 time.sleep(60 * 15)
+#                 continue
+#             if not is_safe_trading_time(alpaca):
+#                 time.sleep(60)
+#                 continue
+#             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Market open — checking stocks...")
+#             import yfinance as yf
+#             for symbol in STOCK_SYMBOLS:
+#                 try:
+#                     bars = yf.Ticker(symbol).history(period="2y", interval="1d")
+#                     bars = bars.reset_index(drop=True)
+#                     bars.columns = [c.lower() for c in bars.columns]
+#                     if len(bars) < 220:
+#                         print(f"  {symbol:<4} | not enough bars — skipping")
+#                         continue
+#                     bars = add_stock_indicators(bars)
+#                     prev = bars.iloc[-2]
+#                     last = bars.iloc[-1]
+#                     price = safe_float(last["close"])
+#                     atr = safe_float(last["atr"])
+#                     signal, strategy, regime = get_stock_signal(bars)
+#                     p = stock_paper[symbol]
+#                     status = "IN TRADE" if p["in_trade"] else "watching"
+#                     macd_dir = "↑" if safe_float(last["macd_hist"]) > 0 else "↓"
+#                     check_stock_exits(symbol, price)
+#                     can_trade = True
+#                     if p["last_loss_time"]:
+#                         elapsed = (datetime.now() - p["last_loss_time"]).total_seconds() / 60
+#                         if elapsed < COOLDOWN_MINUTES:
+#                             can_trade = False
+#                     print(
+#                         f"  {symbol:<4} | {signal:<4} | {strategy:<8} | "
+#                         f"200:{regime['label']:<4} | MACD:{macd_dir} | ${price:>8,.2f} | {status}"
+#                     )
+#                     if signal == "BUY" and not p["in_trade"] and can_trade:
+#                         s_buy(symbol, price, atr, strategy)
+#                     elif signal == "SELL" and p["in_trade"]:
+#                         s_sell(symbol, price)
+#                     time.sleep(1)
+#                 except Exception as e:
+#                     print(f"  {symbol} error: {e}")
+#         except Exception as e:
+#             print(f"Stocks loop error: {e}")
+#         time.sleep(STOCK_SLEEP)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1063,7 +1091,7 @@ if __name__ == "__main__":
     time.sleep(2)
     threading.Thread(target=run_crypto, daemon=True).start()
     time.sleep(3)
-    threading.Thread(target=run_stocks, daemon=True).start()   # exits immediately (stocks disabled)
+    # threading.Thread(target=run_stocks, daemon=True).start()  # STOCKS DISABLED — uncomment to re-enable
     time.sleep(1)
     threading.Thread(target=schedule_daily_report, daemon=True).start()
 

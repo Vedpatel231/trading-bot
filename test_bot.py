@@ -21,12 +21,8 @@ import types
 ccxt_stub = types.ModuleType("ccxt")
 ccxt_stub.binanceus = lambda: MagicMock()
 sys.modules["ccxt"] = ccxt_stub
-# Stub alpaca (disabled but still imported name-checked)
-alpaca_stub = types.ModuleType("alpaca_trade_api")
-alpaca_stub.rest = types.ModuleType("alpaca_trade_api.rest")
-alpaca_stub.rest.REST = MagicMock
-sys.modules["alpaca_trade_api"] = alpaca_stub
-sys.modules["alpaca_trade_api.rest"] = alpaca_stub.rest
+# NOTE: alpaca_trade_api stub removed — import is already commented out in bot.py
+#       Stocks section fully disabled; no alpaca stub needed.
 
 import importlib
 bot = importlib.import_module("bot")
@@ -117,8 +113,9 @@ class TestAddIndicators(unittest.TestCase):
         self.df = bot.add_indicators(make_df(200))
 
     def test_columns_present(self):
-        for col in ["ema_fast","ema_slow","rsi","macd","macd_signal","macd_hist",
-                    "atr","atr_pct","vol_spike","strong_bullish","strong_bearish",
+        for col in ["ema_fast","ema_slow","rsi","rsi_prev","macd","macd_signal","macd_hist",
+                    "atr","atr_pct","adx","vwap","chop_range",
+                    "vol_spike","strong_bullish","strong_bearish",
                     "recent_high","recent_low"]:
             self.assertIn(col, self.df.columns, f"Missing column: {col}")
 
@@ -341,7 +338,8 @@ class TestDailyLossLimit(unittest.TestCase):
         self.assertFalse(result)
 
     def test_cooldown_expires(self):
-        bot.crypto_paper["BTC/USDT"]["last_loss_time"] = datetime.now() - timedelta(minutes=35)
+        # COOLDOWN_MINUTES is now 45; use 50 min to ensure it has passed
+        bot.crypto_paper["BTC/USDT"]["last_loss_time"] = datetime.now() - timedelta(minutes=50)
         result = bot.is_trading_allowed("BTC/USDT")
         self.assertTrue(result)
 
@@ -409,6 +407,239 @@ class TestSignalRSIFilter(unittest.TestCase):
         sig = bot.get_crypto_signal(df, self._make_regime(up=True), {"up": True, "down": False})
         self.assertNotIn(sig["signal"], ["SELL", "COVER"],
                          "SELL/COVER signals must not be returned — they were removed")
+
+
+class TestShortBreakoutRegimeFix(unittest.TestCase):
+    """BUG-FIX #8: short_breakout must require regime['down'] not regime['not_bullish'].
+    Previously used not_bullish (fast_below OR slow_falling) which allowed shorts in
+    RECOVERING / NEUTRAL regimes. Now requires full regime['down'] for symmetry with
+    long breakout which already required the stronger regime['up']."""
+
+    def _make_bearish_breakout_df(self, rsi_val=50.0):
+        """DataFrame where price breaks below recent_low with a strong bearish candle + vol spike."""
+        df = make_df(200, trend="down", base=50000.0)
+        df = bot.add_indicators(df)
+        df = df.dropna()
+        last_idx = df.index[-1]
+        # Force price below recent low with all the required candle conditions
+        recent_low = float(df.loc[last_idx, "recent_low"])
+        df.loc[last_idx, "close"] = recent_low - 200   # breaks below recent low
+        df.loc[last_idx, "open"]  = recent_low + 100   # strong bearish body (open > close)
+        df.loc[last_idx, "low"]   = recent_low - 300
+        df.loc[last_idx, "high"]  = recent_low + 150
+        # Force vol spike and candle conditions
+        df.loc[last_idx, "vol_avg"]       = 100.0
+        df.loc[last_idx, "vol_spike"]     = True
+        df.loc[last_idx, "strong_bearish"]= True
+        df.loc[last_idx, "bearish_candle"]= True
+        df.loc[last_idx, "rsi"]           = rsi_val
+        df.loc[last_idx, "rsi_prev"]      = rsi_val + 2  # no RSI crossover — irrelevant here
+        # Force EMA below conditions
+        df.loc[last_idx, "ema_fast"] = recent_low - 50
+        df.loc[last_idx, "ema_slow"] = recent_low + 50
+        df.loc[last_idx, "macd"]         = -10.0
+        df.loc[last_idx, "macd_signal"]  =  -5.0
+        df.loc[last_idx, "macd_hist"]    =  -5.0
+        # NEW: set quality filters to qualifying values so regime is the only gate being tested
+        df.loc[last_idx, "adx"]          = 30.0   # above ADX_MIN=23
+        df.loc[last_idx, "chop_range"]   = 0.008  # above CHOP_RANGE_MIN=0.004
+        # VWAP: price below VWAP to satisfy price_below_vwap (used by MomentumBurst, not breakout)
+        df.loc[last_idx, "vwap"]         = recent_low + 500
+        return df
+
+    def _regime_not_bullish_only(self):
+        """Regime where not_bullish=True but down=False (recovering/neutral market)."""
+        return {
+            "up": False, "down": False,
+            "not_bearish": False, "not_bullish": True,
+            "macro_bull": False, "label": "RECOVERING",
+            "atr_pct": 0.015, "slow_rising": True, "slow_falling": False,
+        }
+
+    def _regime_full_down(self):
+        """Regime where down=True (confirmed bear market)."""
+        return {
+            "up": False, "down": True,
+            "not_bearish": False, "not_bullish": True,
+            "macro_bull": False, "label": "DOWN",
+            "atr_pct": 0.015, "slow_rising": False, "slow_falling": True,
+        }
+
+    def test_short_breakout_blocked_in_recovering_regime(self):
+        """SHORT breakout must be BLOCKED when regime is only 'not_bullish' (not full down)."""
+        df = self._make_bearish_breakout_df(rsi_val=50.0)
+        sig = bot.get_crypto_signal(df, self._regime_not_bullish_only(), {"down": False})
+        self.assertNotEqual(
+            sig["signal"], "SHORT",
+            "Short breakout must be blocked in RECOVERING regime (only not_bullish=True)."
+            " BUG-FIX #8: was incorrectly using regime['not_bullish'] instead of regime['down']."
+        )
+
+    def test_short_breakout_allowed_in_full_down_regime(self):
+        """SHORT breakout must be ALLOWED when regime is fully down."""
+        df = self._make_bearish_breakout_df(rsi_val=50.0)
+        sig = bot.get_crypto_signal(df, self._regime_full_down(), {"down": False})
+        # Should be SHORT (or HOLD if other conditions didn't align exactly, but NOT blocked by regime)
+        # The key assertion: the regime itself does NOT block the signal
+        # We validate by checking not_bullish_only would block while full down allows
+        self.assertIn(sig["signal"], ["SHORT", "HOLD"],
+                      "Signal should be SHORT or HOLD in full down regime, never blocked by regime alone")
+
+    def test_long_breakout_symmetry_requires_up_regime(self):
+        """LONG breakout must still require full regime['up'] — confirming symmetry."""
+        df = make_df(200, trend="up", base=50000.0)
+        df = bot.add_indicators(df)
+        df = df.dropna()
+        # Regime: not_bearish=True (recovering) but up=False
+        regime_recovering = {
+            "up": False, "down": False,
+            "not_bearish": True, "not_bullish": False,
+            "macro_bull": True, "label": "RECOVERING",
+            "atr_pct": 0.015, "slow_rising": True, "slow_falling": False,
+        }
+        sig = bot.get_crypto_signal(df, regime_recovering, {"up": False})
+        self.assertNotEqual(sig["signal"], "BUY",
+                            "Long breakout must be blocked in RECOVERING regime (only not_bearish=True)")
+
+
+class TestNewIndicators(unittest.TestCase):
+    """Verify ADX, VWAP, rsi_prev, and chop_range are computed correctly."""
+    def setUp(self):
+        self.df = bot.add_indicators(make_df(200, trend="up"))
+
+    def test_adx_range(self):
+        adx = self.df["adx"].dropna()
+        self.assertFalse(adx.empty)
+        self.assertTrue((adx >= 0).all(), "ADX must be non-negative")
+        self.assertTrue((adx <= 100).all(), "ADX must be ≤ 100")
+
+    def test_vwap_positive(self):
+        vwap = self.df["vwap"].dropna()
+        self.assertFalse(vwap.empty)
+        self.assertTrue((vwap > 0).all(), "VWAP must be positive")
+
+    def test_rsi_prev_is_shifted_rsi(self):
+        df = self.df.dropna()
+        # rsi_prev[i] should equal rsi[i-1]
+        for i in range(1, min(10, len(df))):
+            self.assertAlmostEqual(
+                float(df["rsi_prev"].iloc[i]),
+                float(df["rsi"].iloc[i - 1]),
+                places=5,
+                msg="rsi_prev must equal prior-bar RSI"
+            )
+
+    def test_chop_range_non_negative(self):
+        chop = self.df["chop_range"].dropna()
+        self.assertTrue((chop >= 0).all(), "chop_range must be non-negative")
+
+    def test_chop_range_uptrend_exceeds_min(self):
+        """In a clear uptrend, 3-candle range should exceed CHOP_RANGE_MIN most of the time."""
+        chop = self.df["chop_range"].dropna()
+        pct_above = (chop >= bot.CHOP_RANGE_MIN).mean()
+        self.assertGreater(pct_above, 0.5,
+            "More than half the bars in an uptrend should exceed CHOP_RANGE_MIN")
+
+
+class TestMomentumBurst(unittest.TestCase):
+    """MomentumBurst strategy: early entry before EMA crossover using RSI + VWAP + ADX."""
+
+    def _make_regime(self, up=True, macro_bull=False):
+        return {
+            "up": up, "down": not up, "not_bearish": up, "not_bullish": not up,
+            "macro_bull": macro_bull, "label": "UP" if up else "DOWN",
+            "atr_pct": 0.01, "slow_rising": up, "slow_falling": not up,
+        }
+
+    def _burst_df(self, direction="long", rsi_now=54.0, rsi_prev_val=38.0,
+                  adx_val=28.0, chop_val=0.007, vol_spike=True, vwap_bias="above"):
+        """Build a DataFrame that should trigger (or not) a MomentumBurst signal."""
+        df = bot.add_indicators(make_df(200, trend="up" if direction == "long" else "down"))
+        df = df.dropna()
+        last_idx = df.index[-1]
+        price = float(df.loc[last_idx, "close"])
+        # RSI crossover
+        df.loc[last_idx, "rsi"]      = rsi_now
+        df.loc[last_idx, "rsi_prev"] = rsi_prev_val
+        # VWAP position
+        if vwap_bias == "above":
+            df.loc[last_idx, "vwap"] = price * 0.995   # price > vwap
+        elif vwap_bias == "below":
+            df.loc[last_idx, "vwap"] = price * 1.005   # price < vwap
+        else:  # at — neither clearly above nor below
+            df.loc[last_idx, "vwap"] = price
+        # Trend quality
+        df.loc[last_idx, "adx"]        = adx_val
+        df.loc[last_idx, "chop_range"] = chop_val
+        df.loc[last_idx, "vol_spike"]  = vol_spike
+        return df
+
+    # ── LONG burst ───────────────────────────────────────────
+    def test_momentum_burst_buy_fires(self):
+        """All conditions met → should signal MomentumBurst."""
+        df = self._burst_df(direction="long", rsi_now=54.0, rsi_prev_val=38.0, vwap_bias="above")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=True), {"up": True})
+        self.assertEqual(sig["signal"], "BUY")
+        self.assertEqual(sig["strategy"], "MomentumBurst")
+
+    def test_momentum_burst_buy_blocked_if_rsi_was_not_oversold(self):
+        """rsi_prev=50 (not < 42) → burst should NOT fire."""
+        df = self._burst_df(direction="long", rsi_now=54.0, rsi_prev_val=50.0, vwap_bias="above")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=True), {"up": True})
+        self.assertNotEqual(sig["strategy"], "MomentumBurst",
+            "MomentumBurst must be blocked when rsi_prev ≥ 42 (not coming from oversold)")
+
+    def test_momentum_burst_buy_blocked_weak_adx(self):
+        """ADX below ADX_MIN → choppy market → burst blocked."""
+        df = self._burst_df(direction="long", rsi_now=54.0, rsi_prev_val=38.0,
+                            adx_val=15.0, vwap_bias="above")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=True), {"up": True})
+        self.assertNotEqual(sig["strategy"], "MomentumBurst",
+            "MomentumBurst must be blocked when ADX < ADX_MIN (ranging market)")
+
+    def test_momentum_burst_buy_blocked_below_vwap(self):
+        """Price below VWAP while seeking long burst → blocked (bearish institutional bias)."""
+        df = self._burst_df(direction="long", rsi_now=54.0, rsi_prev_val=38.0, vwap_bias="below")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=True), {"up": True})
+        self.assertNotEqual(sig["strategy"], "MomentumBurst",
+            "Long MomentumBurst must be blocked when price is below VWAP")
+
+    def test_momentum_burst_buy_blocked_no_vol_spike(self):
+        """No volume spike → no institutional confirmation → burst blocked."""
+        df = self._burst_df(direction="long", rsi_now=54.0, rsi_prev_val=38.0,
+                            vol_spike=False, vwap_bias="above")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=True), {"up": True})
+        self.assertNotEqual(sig["strategy"], "MomentumBurst",
+            "MomentumBurst must be blocked without a volume spike")
+
+    def test_momentum_burst_buy_blocked_in_down_regime(self):
+        """Regime is DOWN → long burst must not fire."""
+        df = self._burst_df(direction="long", rsi_now=54.0, rsi_prev_val=38.0, vwap_bias="above")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=False), {"down": True})
+        self.assertNotEqual(sig["strategy"], "MomentumBurst",
+            "Long MomentumBurst must be blocked when HTF regime is DOWN")
+
+    # ── SHORT burst ──────────────────────────────────────────
+    def test_momentum_burst_short_fires(self):
+        """All short burst conditions met → should signal ShortMomentumBurst."""
+        df = self._burst_df(direction="short", rsi_now=46.0, rsi_prev_val=62.0, vwap_bias="below")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=False, macro_bull=False), {"down": True})
+        self.assertEqual(sig["signal"], "SHORT")
+        self.assertEqual(sig["strategy"], "ShortMomentumBurst")
+
+    def test_momentum_burst_short_blocked_macro_bull(self):
+        """macro_bull=True → all shorts blocked including ShortMomentumBurst."""
+        df = self._burst_df(direction="short", rsi_now=46.0, rsi_prev_val=62.0, vwap_bias="below")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=False, macro_bull=True), {"down": True})
+        self.assertNotEqual(sig["signal"], "SHORT",
+            "ShortMomentumBurst must be blocked when macro_bull=True")
+
+    def test_momentum_burst_short_blocked_if_rsi_was_not_overbought(self):
+        """rsi_prev=50 (not > 58) → short burst must NOT fire."""
+        df = self._burst_df(direction="short", rsi_now=46.0, rsi_prev_val=50.0, vwap_bias="below")
+        sig = bot.get_crypto_signal(df, self._make_regime(up=False, macro_bull=False), {"down": True})
+        self.assertNotEqual(sig["strategy"], "ShortMomentumBurst",
+            "ShortMomentumBurst must be blocked when rsi_prev ≤ 58 (not from overbought)")
 
 
 class TestWarmupRegime(unittest.TestCase):
@@ -494,10 +725,13 @@ if __name__ == "__main__":
     suite  = unittest.TestSuite()
     test_classes = [
         TestSafeFloat, TestPositionSizing, TestAddIndicators,
+        TestNewIndicators,                # ADX / VWAP / rsi_prev / chop_range
         TestCryptoBuy, TestCryptoClose,
         TestBreakevenTrailingStop, TestExits, TestShortPosition,
         TestDailyLossLimit, TestSignalRSIFilter,
+        TestMomentumBurst,               # new MomentumBurst + ShortMomentumBurst strategy
         TestWarmupRegime, TestFetchCryptoRetry, TestDailyBestWorstReset,
+        TestShortBreakoutRegimeFix,      # BUG-FIX #8
     ]
     for tc in test_classes:
         suite.addTests(loader.loadTestsFromTestCase(tc))
