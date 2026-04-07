@@ -650,31 +650,38 @@ def backtest_symbol(symbol: str, df15: pd.DataFrame, df4h: pd.DataFrame):
 # ══════════════════════════════════════════════════════════════════════
 #  STATISTICS
 # ══════════════════════════════════════════════════════════════════════
-def calc_stats(trades: list, final_balance: float, label: str) -> dict:
+def calc_stats(trades: list, label: str, direction_filter: str = "all") -> dict:
+    """
+    Compute stats for a list of trade dicts.
+    direction_filter: "all" | "long" | "short"
+    """
     if not trades:
-        return {"label": label, "trades": 0}
+        return {"label": label, "direction": direction_filter, "trades": 0}
 
-    df   = pd.DataFrame(trades)
+    df = pd.DataFrame(trades)
+    if direction_filter != "all":
+        df = df[df["direction"] == direction_filter]
+
+    if df.empty:
+        return {"label": label, "direction": direction_filter, "trades": 0}
+
     pnls = df["pnl"].tolist()
     wins = [p for p in pnls if p >= 0]
     loss = [p for p in pnls if p < 0]
 
-    # Running balance for drawdown
-    bal_curve = df["balance"].tolist()
-    peak = bal_curve[0]
-    max_dd = 0.0
-    for b in bal_curve:
-        if b > peak: peak = b
-        dd = (peak - b) / peak
-        if dd > max_dd: max_dd = dd
+    # Running drawdown (uses sorted exit_ts to respect time ordering)
+    df_sorted = df.sort_values("exit_ts")
+    pnl_cum   = df_sorted["pnl"].cumsum()
+    peak      = pnl_cum.cummax()
+    dd_series = (peak - pnl_cum) / (STARTING_BALANCE + peak)
+    max_dd    = float(dd_series.max()) if not dd_series.empty else 0.0
 
-    # Sharpe-like (daily PnL std)
-    df["entry_ts"] = pd.to_datetime(df["entry_ts"])
-    df["exit_ts"]  = pd.to_datetime(df["exit_ts"])
-    daily = df.groupby(df["exit_ts"].dt.date)["pnl"].sum()
-    sharpe = (daily.mean() / daily.std() * (252 ** 0.5)) if daily.std() > 0 else 0.0
+    # Sharpe (annualised from daily P&L)
+    df["exit_ts"] = pd.to_datetime(df["exit_ts"])
+    daily  = df.groupby(df["exit_ts"].dt.date)["pnl"].sum()
+    sharpe = (daily.mean() / daily.std() * (252 ** 0.5)) if len(daily) > 1 and daily.std() > 0 else 0.0
 
-    # Win streak / loss streak
+    # Win / loss streaks
     streak_w = streak_l = cur = 0
     for p in pnls:
         if p >= 0:
@@ -684,108 +691,172 @@ def calc_stats(trades: list, final_balance: float, label: str) -> dict:
             cur = cur - 1 if cur <= 0 else -1
             streak_l = max(streak_l, -cur)
 
-    # Strategy breakdown
-    strat_grp = df.groupby("strategy")["pnl"].agg(["count","sum","mean"])
+    # Strategy breakdown (count, total_pnl, avg_pnl per strategy)
+    strat_grp = df.groupby("strategy")["pnl"].agg(["count", "sum", "mean"])
+
+    # Partial-close rate (NEW only field)
+    half_sold_rate = float(df["half_sold"].mean() * 100) if "half_sold" in df.columns else 0.0
 
     return {
-        "label":         label,
-        "trades":        len(pnls),
-        "win_rate":      round(len(wins) / len(pnls) * 100, 1),
-        "total_pnl":     round(sum(pnls), 2),
-        "return_pct":    round(sum(pnls) / STARTING_BALANCE * 100, 2),
-        "avg_win":       round(np.mean(wins), 2) if wins else 0.0,
-        "avg_loss":      round(np.mean(loss), 2) if loss else 0.0,
-        "profit_factor": round(sum(wins) / abs(sum(loss)), 2) if loss else float("inf"),
-        "max_drawdown":  round(max_dd * 100, 2),
-        "sharpe":        round(sharpe, 2),
-        "best_trade":    round(max(pnls), 2),
-        "worst_trade":   round(min(pnls), 2),
-        "streak_win":    streak_w,
-        "streak_loss":   streak_l,
-        "final_balance": round(final_balance, 2),
+        "label":           label,
+        "direction":       direction_filter,
+        "trades":          len(pnls),
+        "win_rate":        round(len(wins) / len(pnls) * 100, 1),
+        "total_pnl":       round(sum(pnls), 2),
+        "return_pct":      round(sum(pnls) / STARTING_BALANCE * 100, 2),
+        "avg_win":         round(np.mean(wins), 2) if wins else 0.0,
+        "avg_loss":        round(np.mean(loss), 2) if loss else 0.0,
+        "profit_factor":   round(sum(wins) / abs(sum(loss)), 2) if loss else float("inf"),
+        "max_drawdown":    round(max_dd * 100, 2),
+        "sharpe":          round(sharpe, 2),
+        "best_trade":      round(max(pnls), 2),
+        "worst_trade":     round(min(pnls), 2),
+        "streak_win":      streak_w,
+        "streak_loss":     streak_l,
+        "half_sold_rate":  round(half_sold_rate, 1),
         "strat_breakdown": strat_grp.to_dict(),
     }
 
 
-def print_comparison(old_stats: dict, new_stats: dict, symbol: str):
-    def fmt(v, is_pct=False, is_dollar=False):
-        if v is None or (isinstance(v, float) and np.isnan(v)): return "  N/A"
-        if is_dollar: return f"${v:>10,.2f}"
-        if is_pct:    return f"{v:>9.1f}%"
-        return f"{v:>10}"
+# ── Formatting helpers ─────────────────────────────────────────────────────
+def _fv(v, pct=False, dol=False):
+    """Format a stat value for table display."""
+    if v is None or (isinstance(v, float) and (np.isnan(v) or np.isinf(v))):
+        return "     N/A"
+    if dol: return f"${v:>9,.0f}"
+    if pct: return f"{v:>8.1f}%"
+    if isinstance(v, float): return f"{v:>9.2f}"
+    return f"{v:>9}"
 
-    SEP = "─" * 68
-    print(f"\n{'═'*68}")
-    print(f"  {symbol}  —  OLD fixed TP/SL  vs  NEW trailing TP/SL")
-    print(f"{'═'*68}")
-    print(f"  {'Metric':<26}  {'OLD (fixed)':>14}  {'NEW (trailing)':>14}")
-    print(SEP)
+def _better(label, ov, nv) -> str:
+    """Return ✅ if new is better, ❌ if worse, blank if equal/N/A."""
+    if ov is None or nv is None: return ""
+    if not (isinstance(ov, (int, float)) and isinstance(nv, (int, float))): return ""
+    higher_is_better = label in {
+        "Win rate", "Total P&L", "Return %", "Profit factor",
+        "Avg win", "Best trade", "Sharpe ratio",
+        "Win streak", "Partial close %",
+    }
+    lower_is_better = label in {"Max drawdown", "Loss streak"}
+    # Avg loss and Worst trade: less negative = better → higher is better
+    if label in ("Avg loss", "Worst trade"):
+        higher_is_better = True
+    if higher_is_better:
+        return " ✅" if nv > ov else (" ❌" if nv < ov else "")
+    if lower_is_better:
+        return " ✅" if nv < ov else (" ❌" if nv > ov else "")
+    return ""
+
+
+def print_direction_block(title: str, s_old: dict, s_new: dict):
+    """Print a single OLD vs NEW comparison block for one direction."""
+    W = 72
+    print(f"\n  ┌{'─'*(W-2)}┐")
+    print(f"  │  {title:<{W-5}}│")
+    print(f"  ├{'─'*22}┬{'─'*22}┬{'─'*22}┤")
+    print(f"  │  {'Metric':<20}│  {'OLD (fixed)':^19}│  {'NEW (trailing)':^19}│")
+    print(f"  ├{'─'*22}┼{'─'*22}┼{'─'*22}┤")
 
     rows = [
-        ("Trades",              old_stats.get("trades"),     new_stats.get("trades"),     False, False),
-        ("Win rate",            old_stats.get("win_rate"),   new_stats.get("win_rate"),   True,  False),
-        ("Total P&L",           old_stats.get("total_pnl"),  new_stats.get("total_pnl"),  False, True),
-        ("Return %",            old_stats.get("return_pct"), new_stats.get("return_pct"), True,  False),
-        ("Profit factor",       old_stats.get("profit_factor"),new_stats.get("profit_factor"),False,False),
-        ("Avg win",             old_stats.get("avg_win"),    new_stats.get("avg_win"),    False, True),
-        ("Avg loss",            old_stats.get("avg_loss"),   new_stats.get("avg_loss"),   False, True),
-        ("Best trade",          old_stats.get("best_trade"), new_stats.get("best_trade"), False, True),
-        ("Worst trade",         old_stats.get("worst_trade"),new_stats.get("worst_trade"),False, True),
-        ("Max drawdown",        old_stats.get("max_drawdown"),new_stats.get("max_drawdown"),True, False),
-        ("Sharpe ratio",        old_stats.get("sharpe"),     new_stats.get("sharpe"),     False, False),
-        ("Longest win streak",  old_stats.get("streak_win"), new_stats.get("streak_win"), False, False),
-        ("Longest loss streak", old_stats.get("streak_loss"),new_stats.get("streak_loss"),False, False),
-        ("Final balance",       old_stats.get("final_balance"),new_stats.get("final_balance"),False,True),
+        ("Trades",         s_old.get("trades"),          s_new.get("trades"),          False, False),
+        ("Win rate",       s_old.get("win_rate"),         s_new.get("win_rate"),         True,  False),
+        ("Total P&L",      s_old.get("total_pnl"),        s_new.get("total_pnl"),        False, True),
+        ("Return %",       s_old.get("return_pct"),       s_new.get("return_pct"),       True,  False),
+        ("Profit factor",  s_old.get("profit_factor"),    s_new.get("profit_factor"),    False, False),
+        ("Avg win",        s_old.get("avg_win"),          s_new.get("avg_win"),          False, True),
+        ("Avg loss",       s_old.get("avg_loss"),         s_new.get("avg_loss"),         False, True),
+        ("Best trade",     s_old.get("best_trade"),       s_new.get("best_trade"),       False, True),
+        ("Worst trade",    s_old.get("worst_trade"),      s_new.get("worst_trade"),      False, True),
+        ("Max drawdown",   s_old.get("max_drawdown"),     s_new.get("max_drawdown"),     True,  False),
+        ("Sharpe ratio",   s_old.get("sharpe"),           s_new.get("sharpe"),           False, False),
+        ("Win streak",     s_old.get("streak_win"),       s_new.get("streak_win"),       False, False),
+        ("Loss streak",    s_old.get("streak_loss"),      s_new.get("streak_loss"),      False, False),
+        ("Partial close %","—",                           s_new.get("half_sold_rate"),   True,  False),
     ]
 
     for label, ov, nv, pct, dol in rows:
-        # Highlight improvements
-        better = ""
-        if ov is not None and nv is not None and isinstance(ov, (int,float)) and isinstance(nv,(int,float)):
-            better_new = (
-                (label in ("Win rate","Total P&L","Return %","Profit factor","Avg win","Best trade","Final balance","Sharpe ratio","Longest win streak") and nv > ov)
-                or (label in ("Avg loss","Worst trade","Max drawdown","Longest loss streak") and nv > ov and label == "Avg loss")
-                or (label in ("Max drawdown","Longest loss streak") and nv < ov)
-            )
-            better = "  ✅" if better_new else ""
+        badge = _better(label, ov if ov != "—" else None, nv)
+        ov_s  = "        —" if ov == "—" else _fv(ov, pct, dol)
+        nv_s  = _fv(nv, pct, dol) + badge
+        print(f"  │  {label:<20}│  {ov_s:^19}│  {nv_s:<19}│")
 
-        print(f"  {label:<26}  {fmt(ov,pct,dol):>14}  {fmt(nv,pct,dol):>14}{better}")
+    print(f"  └{'─'*22}┴{'─'*22}┴{'─'*22}┘")
 
-    print(SEP)
 
-    # Strategy breakdown
-    if "strat_breakdown" in new_stats and new_stats["strat_breakdown"].get("count"):
-        print(f"\n  Strategy breakdown (NEW):")
-        counts = new_stats["strat_breakdown"]["count"]
-        pnls_s = new_stats["strat_breakdown"]["sum"]
-        means  = new_stats["strat_breakdown"]["mean"]
-        for s in sorted(counts):
-            print(f"    {s:<18}  {int(counts.get(s,0)):>4} trades  "
-                  f"P&L ${pnls_s.get(s,0):>8,.2f}  avg ${means.get(s,0):>7.2f}")
+def print_strategy_breakdown(trades_old: list, trades_new: list, direction_filter: str):
+    """Per-strategy breakdown for OLD and NEW, given direction."""
+    df_o = pd.DataFrame(trades_old) if trades_old else pd.DataFrame()
+    df_n = pd.DataFrame(trades_new) if trades_new else pd.DataFrame()
+
+    if not df_o.empty and direction_filter != "all":
+        df_o = df_o[df_o["direction"] == direction_filter]
+    if not df_n.empty and direction_filter != "all":
+        df_n = df_n[df_n["direction"] == direction_filter]
+
+    strategies = set()
+    if not df_o.empty and "strategy" in df_o.columns:
+        strategies |= set(df_o["strategy"].unique())
+    if not df_n.empty and "strategy" in df_n.columns:
+        strategies |= set(df_n["strategy"].unique())
+
+    if not strategies:
+        return
+
+    print(f"\n  Strategy breakdown  ({direction_filter.upper()}):")
+    print(f"  {'Strategy':<18}  {'OLD trades':>10}  {'OLD P&L':>10}  {'NEW trades':>10}  {'NEW P&L':>10}  {'Δ P&L':>10}")
+    print(f"  {'─'*18}  {'─'*10}  {'─'*10}  {'─'*10}  {'─'*10}  {'─'*10}")
+
+    for strat in sorted(strategies):
+        grp_o = df_o[df_o["strategy"] == strat]["pnl"] if not df_o.empty else pd.Series(dtype=float)
+        grp_n = df_n[df_n["strategy"] == strat]["pnl"] if not df_n.empty else pd.Series(dtype=float)
+        ct_o  = len(grp_o);  ct_n = len(grp_n)
+        pl_o  = grp_o.sum(); pl_n = grp_n.sum()
+        delta = pl_n - pl_o
+        badge = " ✅" if delta > 0 else (" ❌" if delta < 0 else "")
+        print(f"  {strat:<18}  {ct_o:>10}  ${pl_o:>9,.0f}  {ct_n:>10}  ${pl_n:>9,.0f}  ${delta:>+9,.0f}{badge}")
+
+
+def print_symbol_report(symbol: str, trades_old: list, trades_new: list):
+    """Full OLD vs NEW report for one symbol — Longs, Shorts, Combined."""
+    W = 72
+    print(f"\n{'═'*W}")
+    print(f"  📊  {symbol}  —  OLD fixed TP/SL  vs  NEW trailing TP/SL")
+    print(f"{'═'*W}")
+
+    for direction, label in [("long", "🟢 LONGS"), ("short", "🔴 SHORTS"), ("all", "⚪ COMBINED")]:
+        s_old = calc_stats(trades_old, "OLD", direction)
+        s_new = calc_stats(trades_new, "NEW", direction)
+
+        if s_old.get("trades", 0) == 0 and s_new.get("trades", 0) == 0:
+            print(f"\n  {label}: no trades found")
+            continue
+
+        print_direction_block(label, s_old, s_new)
+        print_strategy_breakdown(trades_old, trades_new, direction)
 
 
 # ══════════════════════════════════════════════════════════════════════
 #  MAIN
 # ══════════════════════════════════════════════════════════════════════
 def main():
-    print("╔══════════════════════════════════════════════════════╗")
-    print("║  BACKTEST — Trailing TP/SL vs Fixed TP/SL           ║")
-    print(f"║  Period: {YEARS_BACK} years  |  TF: {CRYPTO_TF}  |  HTF: {CRYPTO_HTF}           ║")
-    print(f"║  Symbols: {', '.join(CRYPTO_SYMBOLS):<42}║")
-    print("╚══════════════════════════════════════════════════════╝\n")
+    W = 72
+    print(f"╔{'═'*(W-2)}╗")
+    print(f"║  BACKTEST — Trailing TP/SL vs Fixed TP/SL  (Longs + Shorts){' '*(W-62)}║")
+    print(f"║  Period: {YEARS_BACK}y  |  TF: {CRYPTO_TF}  |  HTF: {CRYPTO_HTF}  |  Starting: ${STARTING_BALANCE:,.0f}/symbol{' '*(W-66)}║")
+    print(f"║  Symbols: {', '.join(CRYPTO_SYMBOLS):<{W-12}}║")
+    print(f"╚{'═'*(W-2)}╝\n")
 
-    all_old_trades = []
-    all_new_trades = []
-    final_bals = {}
+    all_old_trades: list = []
+    all_new_trades: list = []
+    symbol_results: dict = {}   # symbol → (t_old, t_new, bal_old, bal_new)
 
     for symbol in CRYPTO_SYMBOLS:
-        print(f"\n{'─'*50}")
-        print(f"  📊  {symbol}")
-        print(f"{'─'*50}")
+        print(f"\n{'─'*W}")
+        print(f"  Fetching data for {symbol} …")
+        print(f"{'─'*W}")
 
-        # Fetch data
-        df15 = fetch_ohlcv_full(symbol, CRYPTO_TF,   YEARS_BACK)
-        df4h = fetch_ohlcv_full(symbol, CRYPTO_HTF,  YEARS_BACK)
+        df15 = fetch_ohlcv_full(symbol, CRYPTO_TF,  YEARS_BACK)
+        df4h = fetch_ohlcv_full(symbol, CRYPTO_HTF, YEARS_BACK)
 
         if len(df15) < 500:
             print(f"  ⚠️  Not enough data for {symbol} — skipping")
@@ -794,38 +865,66 @@ def main():
         t_old, t_new, bal_old, bal_new = backtest_symbol(symbol, df15, df4h)
         all_old_trades.extend(t_old)
         all_new_trades.extend(t_new)
-        final_bals[symbol] = (bal_old, bal_new)
+        symbol_results[symbol] = (t_old, t_new, bal_old, bal_new)
 
-        s_old = calc_stats(t_old, bal_old, "OLD")
-        s_new = calc_stats(t_new, bal_new, "NEW")
-        print_comparison(s_old, s_new, symbol)
+        # Per-symbol report (Longs / Shorts / Combined)
+        print_symbol_report(symbol, t_old, t_new)
 
-    # ── Combined summary ──────────────────────────────────────────
-    print(f"\n{'═'*68}")
-    print("  COMBINED SUMMARY  —  All symbols")
-    print(f"{'═'*68}")
-    total_bal_old = sum(v[0] for v in final_bals.values())
-    total_bal_new = sum(v[1] for v in final_bals.values())
-    total_start   = STARTING_BALANCE * len(final_bals)
-    print(f"  Starting capital:   ${total_start:>12,.2f}")
-    print(f"  OLD final balance:  ${total_bal_old:>12,.2f}  ({(total_bal_old-total_start)/total_start*100:+.1f}%)")
-    print(f"  NEW final balance:  ${total_bal_new:>12,.2f}  ({(total_bal_new-total_start)/total_start*100:+.1f}%)")
-    extra = total_bal_new - total_bal_old
-    print(f"  Extra profit (NEW): ${extra:>12,.2f}  ({extra/total_start*100:+.1f}% vs OLD)")
-    print(f"  OLD trades:  {len(all_old_trades):>6}    NEW trades:  {len(all_new_trades):>6}")
+    # ── All-symbols combined report ───────────────────────────────
+    if symbol_results:
+        print(f"\n{'═'*W}")
+        print(f"  🌐  ALL SYMBOLS COMBINED  —  Longs + Shorts + Overall")
+        print(f"{'═'*W}")
+        print_symbol_report("BTC + ETH + SOL", all_old_trades, all_new_trades)
 
-    # ── Save to CSV ───────────────────────────────────────────────
-    out_dir  = os.path.dirname(__file__)
-    csv_old  = os.path.join(out_dir, "backtest_old_trades.csv")
-    csv_new  = os.path.join(out_dir, "backtest_new_trades.csv")
-    if all_old_trades:
-        pd.DataFrame(all_old_trades).to_csv(csv_old, index=False)
-        print(f"\n  💾  OLD trades saved → {csv_old}")
-    if all_new_trades:
-        pd.DataFrame(all_new_trades).to_csv(csv_new, index=False)
-        print(f"  💾  NEW trades saved → {csv_new}")
+    # ── High-level P&L summary ────────────────────────────────────
+    print(f"\n{'═'*W}")
+    print(f"  💰  FINAL BALANCE SUMMARY")
+    print(f"{'═'*W}")
+    print(f"  {'Symbol':<12}  {'Start':>10}  {'OLD final':>12}  {'OLD ret':>8}  {'NEW final':>12}  {'NEW ret':>8}  {'Extra $':>10}")
+    print(f"  {'─'*12}  {'─'*10}  {'─'*12}  {'─'*8}  {'─'*12}  {'─'*8}  {'─'*10}")
 
-    print("\n  ✅  Backtest complete.\n")
+    total_start = total_old = total_new = 0.0
+    for sym, (_, _, b_old, b_new) in symbol_results.items():
+        start = STARTING_BALANCE
+        ret_o = (b_old - start) / start * 100
+        ret_n = (b_new - start) / start * 100
+        extra = b_new - b_old
+        badge = " ✅" if extra > 0 else " ❌"
+        print(f"  {sym:<12}  ${start:>9,.0f}  ${b_old:>11,.0f}  {ret_o:>+7.1f}%  ${b_new:>11,.0f}  {ret_n:>+7.1f}%  ${extra:>+9,.0f}{badge}")
+        total_start += start; total_old += b_old; total_new += b_new
+
+    if symbol_results:
+        total_extra = total_new - total_old
+        ret_o_t = (total_old - total_start) / total_start * 100
+        ret_n_t = (total_new - total_start) / total_start * 100
+        print(f"  {'─'*12}  {'─'*10}  {'─'*12}  {'─'*8}  {'─'*12}  {'─'*8}  {'─'*10}")
+        print(f"  {'TOTAL':<12}  ${total_start:>9,.0f}  ${total_old:>11,.0f}  {ret_o_t:>+7.1f}%  ${total_new:>11,.0f}  {ret_n_t:>+7.1f}%  ${total_extra:>+9,.0f}")
+
+    print(f"\n  OLD trades total: {len(all_old_trades):>5}   "
+          f"({sum(1 for t in all_old_trades if t['direction']=='long')} long / "
+          f"{sum(1 for t in all_old_trades if t['direction']=='short')} short)")
+    print(f"  NEW trades total: {len(all_new_trades):>5}   "
+          f"({sum(1 for t in all_new_trades if t['direction']=='long')} long / "
+          f"{sum(1 for t in all_new_trades if t['direction']=='short')} short)")
+
+    # ── Save CSVs ─────────────────────────────────────────────────
+    out_dir = os.path.dirname(os.path.abspath(__file__))
+    for label, trades in [("old", all_old_trades), ("new", all_new_trades)]:
+        if not trades:
+            continue
+        df_out = pd.DataFrame(trades)
+        # Add a human-readable hold_time column
+        df_out["entry_ts"] = pd.to_datetime(df_out["entry_ts"])
+        df_out["exit_ts"]  = pd.to_datetime(df_out["exit_ts"])
+        df_out["hold_hours"] = (df_out["exit_ts"] - df_out["entry_ts"]).dt.total_seconds() / 3600
+        path = os.path.join(out_dir, f"backtest_{label}_trades.csv")
+        df_out.to_csv(path, index=False)
+        print(f"\n  💾  {label.upper()} trades ({len(trades)}) → {path}")
+
+    print(f"\n{'═'*W}")
+    print("  ✅  Backtest complete.")
+    print(f"{'═'*W}\n")
 
 
 if __name__ == "__main__":
