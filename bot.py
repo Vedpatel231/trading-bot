@@ -98,13 +98,14 @@ portfolio = {
 
 positions = {
     s: {
-        "in_trade":    False,
-        "coin_held":   0.0,
-        "entry_price": 0.0,
-        "entry_atr":   0.0,
-        "stop_price":  0.0,
-        "tp_price":    0.0,
-        "entry_time":  None,
+        "in_trade":         False,
+        "coin_held":        0.0,
+        "entry_price":      0.0,
+        "entry_total_cost": 0.0,   # cost + entry fee (used for accurate P&L)
+        "entry_atr":        0.0,
+        "stop_price":       0.0,
+        "tp_price":         0.0,
+        "entry_time":       None,
     }
     for s in SYMBOLS
 }
@@ -252,13 +253,14 @@ def open_trade(symbol, price, atr):
 
     portfolio["balance"] -= (cost + fee)
     pos.update({
-        "in_trade":    True,
-        "coin_held":   qty,
-        "entry_price": price,
-        "entry_atr":   atr,
-        "stop_price":  stop_price,
-        "tp_price":    tp_price,
-        "entry_time":  datetime.now(),
+        "in_trade":         True,
+        "coin_held":        qty,
+        "entry_price":      price,
+        "entry_total_cost": cost + fee,   # full cost basis incl. entry fee
+        "entry_atr":        atr,
+        "stop_price":       stop_price,
+        "tp_price":         tp_price,
+        "entry_time":       datetime.now(),
     })
 
     coin = symbol.split("/")[0]
@@ -284,7 +286,8 @@ def close_trade(symbol, price, reason="Signal"):
 
     proceeds = pos["coin_held"] * price
     fee      = proceeds * TRADING_FEE_PCT
-    pnl      = (proceeds - fee) - (pos["coin_held"] * pos["entry_price"])
+    # Subtract entry_total_cost (which includes entry fee) for accurate net P&L
+    pnl      = (proceeds - fee) - pos["entry_total_cost"]
 
     portfolio["balance"]      += proceeds - fee
     portfolio["total_pnl"]    += pnl
@@ -307,13 +310,14 @@ def close_trade(symbol, price, reason="Signal"):
 
     # Reset position state
     pos.update({
-        "in_trade":    False,
-        "coin_held":   0.0,
-        "entry_price": 0.0,
-        "entry_atr":   0.0,
-        "stop_price":  0.0,
-        "tp_price":    0.0,
-        "entry_time":  None,
+        "in_trade":         False,
+        "coin_held":        0.0,
+        "entry_price":      0.0,
+        "entry_total_cost": 0.0,
+        "entry_atr":        0.0,
+        "stop_price":       0.0,
+        "tp_price":         0.0,
+        "entry_time":       None,
     })
 
     msg = (
@@ -430,11 +434,15 @@ def run_bot():
                     )
                     _, st_dir = compute_supertrend(df, ST_PERIOD, ST_MULT)
 
-                    candle_ts   = df.index[-1]
-                    cur_dir     = int(st_dir.iloc[-1])
-                    prev_dir    = int(st_dir.iloc[-2])
-                    cur_atr     = safe_float(atr.iloc[-1])
-                    price       = safe_float(df["close"].iloc[-1])
+                    # Binance returns 199 completed candles + 1 still-forming candle.
+                    # iloc[-1] = today's incomplete candle (price still moving).
+                    # iloc[-2] = yesterday's completed candle — use this for signals.
+                    # We track iloc[-2]'s timestamp so is_new fires once per closed day.
+                    candle_ts   = df.index[-2]            # last COMPLETED candle
+                    cur_dir     = int(st_dir.iloc[-2])    # direction of last completed bar
+                    prev_dir    = int(st_dir.iloc[-3])    # direction of bar before that
+                    cur_atr     = safe_float(atr.iloc[-2])
+                    price       = safe_float(df["close"].iloc[-2])
                     is_new      = (candle_ts != last_candle_ts[symbol])
 
                     st_lbl   = "↑BULL" if cur_dir == 1 else "↓BEAR"
