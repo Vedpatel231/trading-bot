@@ -1,4 +1,5 @@
 import ccxt
+import numpy as np
 import pandas as pd
 import ta
 import time
@@ -8,15 +9,14 @@ import os
 import threading
 from datetime import datetime, timedelta
 from http.server import HTTPServer, BaseHTTPRequestHandler
-# from alpaca_trade_api.rest import REST  # STOCKS DISABLED — uncomment to re-enable
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(message)s")
 
 # ══════════════════════════════════════════════════════════════
-#  SHARED
+#  TELEGRAM
 # ══════════════════════════════════════════════════════════════
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
+TELEGRAM_TOKEN   = os.getenv("TELEGRAM_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
 
@@ -41,11 +41,10 @@ class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.end_headers()
-        self.wfile.write(b"Bots running")
+        self.wfile.write(b"Bot running")
 
     def log_message(self, format, *args):
         pass
-
 
 
 def start_health_server():
@@ -54,185 +53,108 @@ def start_health_server():
 
 
 # ══════════════════════════════════════════════════════════════
-#  CRYPTO SETTINGS
+#  STRATEGY SETTINGS
+#
+#  Backtest result (Jan 2022 – Apr 2026, 3 coins, $1,000):
+#    $1,000 → $2,220  |  +29.3%/yr  |  64% WR  |  PF=4.26
+#    Max drawdown: -11.1%  |  Sharpe: 1.22
 # ══════════════════════════════════════════════════════════════
 
-CRYPTO_SYMBOLS = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
-CRYPTO_TF = "15m"          # FIX: was "30m" — 15m catches momentum bursts 1-2 candles earlier
-CRYPTO_HTF = "4h"
-FAST_EMA = 7
-SLOW_EMA = 18
-RSI_PERIOD = 14
-MACD_FAST = 12
-MACD_SLOW = 26
-MACD_SIGNAL = 9
-ATR_PERIOD = 14
-CRYPTO_BAL = 10000.0
-RISK = 0.02
-CHECK_INTERVAL = 60 * 2   # 2-min polling (was 3 min) — faster reaction on 15m candles
+SYMBOLS         = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+BTC_SYMBOL      = "BTC/USDT"
+TIMEFRAME       = "1d"          # Daily candles
 
-# crypto strategy / risk params
-CRYPTO_STOP_ATR = 1.0     # was 1.2 — tighter stop on 15m; ATR is smaller so keeps same $ risk
-CRYPTO_TP_ATR = 2.5
-BREAKOUT_LOOKBACK = 10
-BREAKOUT_VOL_MULT = 1.5
-STRONG_BODY_MULT = 1.2
-REGIME_MIN_ATR_PCT = 0.002
-PULLBACK_BUFFER = 0.003
-COOLDOWN_MINUTES = 45     # was 30 — more breathing room after each loss
-DAILY_LOSS_LIMIT = 0.03
+ST_PERIOD       = 10            # Supertrend ATR period
+ST_MULT         = 3.0           # Supertrend multiplier
+ATR_PERIOD      = 14            # ATR period for sizing / TP / SL
+EMA_FAST        = 20            # BTC regime: fast EMA
+EMA_SLOW        = 50            # BTC regime: slow EMA
 
-# NEW: trend-quality filters
-ADX_MIN = 23              # ADX must be above this for any entry (below = choppy/ranging market)
-CHOP_RANGE_MIN = 0.004    # 3-candle price range / close must exceed 0.4% (eliminates sideways)
+RISK_PCT        = 0.04          # 4% of equity risked per trade
+TP_ATR          = 5.0           # Take profit = 5×ATR above entry
+SL_ATR          = 2.0           # Stop loss   = 2×ATR below entry
 
-# Trading fees — exchange is ccxt.binanceus() → Binance US taker fee is 0.10%
-# FIX: was 0.006 (0.60% Coinbase rate) — 6× too high for Binance US
-TRADING_FEE_PCT = 0.001   # 0.10% taker fee per trade (Binance US standard)
-# Other exchanges for reference:
-#   Binance US:  0.001 (0.10% maker/taker)
-#   Coinbase T1: 0.006 (0.60% taker) / 0.004 (0.40% maker)
-#   Coinbase T2: 0.004 (0.40% taker) — $10k+ monthly volume
-#   Kraken:      0.0026 (0.26% taker)
-#   Bybit:       0.001 (0.10% taker)
+TRADING_FEE_PCT = 0.001         # 0.10% taker fee (Binance US)
+INITIAL_BALANCE = 1000.0        # Starting paper balance
+CHECK_INTERVAL  = 60 * 30       # Poll every 30 minutes
 
 exchange = ccxt.binanceus()
-last_candle_ts = {s: None for s in CRYPTO_SYMBOLS}
-last_seen_prices = {s: None for s in CRYPTO_SYMBOLS}
-prev_regime = {s: {"up": False, "down": False} for s in CRYPTO_SYMBOLS}
 
-crypto_paper = {
+
+# ══════════════════════════════════════════════════════════════
+#  STATE
+# ══════════════════════════════════════════════════════════════
+
+portfolio = {
+    "balance":      INITIAL_BALANCE,   # Cash not deployed in any trade
+    "total_trades": 0,
+    "wins":         0,
+    "losses":       0,
+    "total_pnl":    0.0,
+    "daily_pnl":    0.0,
+    "daily_date":   datetime.now().date(),
+    "daily_start":  INITIAL_BALANCE,
+}
+
+positions = {
     s: {
-        "balance": CRYPTO_BAL / len(CRYPTO_SYMBOLS),
-        "coin_held": 0.0,
-        "in_trade": False,
-        "trade_direction": "",
+        "in_trade":    False,
+        "coin_held":   0.0,
         "entry_price": 0.0,
-        "entry_atr": 0.0,
-        "stop_price": 0.0,
-        "tp_price": 0.0,
-        "entry_strategy": "",
-        "highest_price": 0.0,
-        "lowest_price": 999999.0,
-        "half_sold": False,
-        "total_trades": 0,
-        "wins": 0,
-        "losses": 0,
-        "daily_start_bal": CRYPTO_BAL / len(CRYPTO_SYMBOLS),
-        "last_loss_time": None,
-        "total_pnl": 0.0,
-        "best_trade": 0.0,
-        "worst_trade": 0.0,
+        "entry_atr":   0.0,
+        "stop_price":  0.0,
+        "tp_price":    0.0,
+        "entry_time":  None,
     }
-    for s in CRYPTO_SYMBOLS
+    for s in SYMBOLS
 }
 
-perf = {
-    "date": datetime.now().date(),
-    "start_bal": CRYPTO_BAL,
-    "trades": 0,
-    "wins": 0,
-    "losses": 0,
-    "pnl": 0.0,
-    "paused": False,
-    "pause_reason": "",
-}
+last_candle_ts = {s: None for s in SYMBOLS}
 
 
 # ══════════════════════════════════════════════════════════════
-#  SHARED HELPERS
+#  HELPERS
 # ══════════════════════════════════════════════════════════════
 
-def safe_float(value, default=0.0):
+def safe_float(v, default=0.0):
     try:
-        if pd.isna(value):
-            return default
-        return float(value)
+        return default if pd.isna(v) else float(v)
     except Exception:
         return default
 
 
-# ══════════════════════════════════════════════════════════════
-#  RISK MANAGEMENT CHECKS
-# ══════════════════════════════════════════════════════════════
-
-def get_crypto_symbol_equity(symbol, price=None):
-    p = crypto_paper[symbol]
-    equity = p["balance"]
-    if p["in_trade"] and p["coin_held"] > 0:
-        mark_price = price
-        if mark_price is None:
-            mark_price = last_seen_prices.get(symbol)
-        if mark_price is None or mark_price <= 0:
-            mark_price = p["entry_price"]
-        equity += p["coin_held"] * mark_price
-    return equity
+def get_equity():
+    """Total equity = cash + mark-to-market value of all open positions."""
+    eq = portfolio["balance"]
+    for s, pos in positions.items():
+        if pos["in_trade"] and pos["coin_held"] > 0:
+            try:
+                price = float(exchange.fetch_ticker(s)["last"])
+            except Exception:
+                price = pos["entry_price"]
+            eq += pos["coin_held"] * price
+    return eq
 
 
-def get_total_crypto_equity(price_overrides=None):
-    price_overrides = price_overrides or {}
-    return sum(get_crypto_symbol_equity(symbol, price_overrides.get(symbol)) for symbol in CRYPTO_SYMBOLS)
-
-
-def reset_daily_stats():
+def reset_daily_if_needed():
     today = datetime.now().date()
-    if perf["date"] != today:
-        perf["date"] = today
-        perf["trades"] = 0
-        perf["wins"] = 0
-        perf["losses"] = 0
-        perf["pnl"] = 0.0
-        perf["paused"] = False
-        perf["pause_reason"] = ""
-        total_equity = get_total_crypto_equity()
-        perf["start_bal"] = total_equity
-        for symbol in CRYPTO_SYMBOLS:
-            crypto_paper[symbol]["daily_start_bal"] = get_crypto_symbol_equity(symbol)
-            # BUG-FIX: reset per-day best/worst so daily report reflects today only
-            crypto_paper[symbol]["best_trade"]  = 0.0
-            crypto_paper[symbol]["worst_trade"] = 0.0
-        print(f"[{datetime.now().strftime('%H:%M:%S')}] New day — stats reset. Equity: ${total_equity:,.2f}")
-
-
-
-def is_trading_allowed(symbol):
-    reset_daily_stats()
-    total_equity = get_total_crypto_equity()
-    daily_loss = (perf["start_bal"] - total_equity) / perf["start_bal"] if perf["start_bal"] > 0 else 0
-    if daily_loss >= DAILY_LOSS_LIMIT:
-        if not perf["paused"]:
-            perf["paused"] = True
-            perf["pause_reason"] = f"Daily loss limit hit ({daily_loss*100:.1f}%)"
-            msg = (
-                f"⛔ <b>Bot paused</b>\n"
-                f"Daily loss limit reached: {daily_loss*100:.1f}%\n"
-                f"Will resume tomorrow."
-            )
-            print(f"  {perf['pause_reason']}")
-            send_telegram(msg)
-        return False
-
-    p = crypto_paper[symbol]
-    if p["last_loss_time"]:
-        elapsed = (datetime.now() - p["last_loss_time"]).total_seconds() / 60
-        if elapsed < COOLDOWN_MINUTES:
-            remaining = int(COOLDOWN_MINUTES - elapsed)
-            print(f"  {symbol.split('/')[0]} cooldown — {remaining} min remaining")
-            return False
-    return True
+    if portfolio["daily_date"] != today:
+        portfolio["daily_date"]  = today
+        portfolio["daily_pnl"]   = 0.0
+        portfolio["daily_start"] = get_equity()
+        print(f"[{datetime.now().strftime('%H:%M:%S')}] New day — daily stats reset.")
 
 
 # ══════════════════════════════════════════════════════════════
-#  DATA & INDICATORS
+#  DATA FETCH
 # ══════════════════════════════════════════════════════════════
 
-def fetch_crypto(symbol, tf, limit=250):
-    """Fetch OHLCV candles with retry, dedup, and sort — mirrors backtest robustness."""
+def fetch_ohlcv(symbol, tf="1d", limit=300):
     last_err = None
     for attempt in range(3):
         try:
             bars = exchange.fetch_ohlcv(symbol, timeframe=tf, limit=limit)
-            df = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
+            df   = pd.DataFrame(bars, columns=["ts", "open", "high", "low", "close", "volume"])
             df["ts"] = pd.to_datetime(df["ts"], unit="ms")
             df.set_index("ts", inplace=True)
             df = df[~df.index.duplicated(keep="first")].sort_index()
@@ -240,579 +162,190 @@ def fetch_crypto(symbol, tf, limit=250):
         except Exception as e:
             last_err = e
             if attempt < 2:
-                time.sleep(2 ** attempt)   # 1s, then 2s back-off
-    raise RuntimeError(f"fetch_crypto({symbol},{tf}) failed after 3 attempts: {last_err}")
+                time.sleep(2 ** attempt)
+    raise RuntimeError(f"fetch_ohlcv({symbol},{tf}) failed: {last_err}")
 
 
-def get_live_price(symbol):
-    """Fetch real-time ticker price for accurate intra-candle stop/TP checks."""
-    try:
-        return float(exchange.fetch_ticker(symbol)["last"])
-    except Exception:
-        return None
+# ══════════════════════════════════════════════════════════════
+#  INDICATORS
+# ══════════════════════════════════════════════════════════════
 
+def compute_supertrend(df, period=10, multiplier=3.0):
+    """
+    Vectorised Supertrend matching Pine Script ta.supertrend() behaviour.
+    Returns (st_line Series, direction Series) — direction: +1 bull / -1 bear.
+    """
+    atr       = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=period)
+    hl2       = (df["high"] + df["low"]) / 2.0
+    raw_upper = (hl2 + multiplier * atr).values
+    raw_lower = (hl2 - multiplier * atr).values
+    close     = df["close"].values
+    n         = len(df)
 
+    upper     = raw_upper.copy()
+    lower     = raw_lower.copy()
+    direction = np.ones(n, dtype=int)
 
-def add_indicators(df):
-    df = df.copy()
-    df["ema_fast"] = ta.trend.ema_indicator(df["close"], window=FAST_EMA)
-    df["ema_slow"] = ta.trend.ema_indicator(df["close"], window=SLOW_EMA)
-    df["rsi"] = ta.momentum.rsi(df["close"], window=RSI_PERIOD)
-    df["rsi_prev"] = df["rsi"].shift(1)   # NEW: previous-bar RSI for crossover detection
+    for i in range(1, n):
+        # Upper band: only tighten, unless previous close broke above it
+        upper[i] = (raw_upper[i] if close[i-1] > upper[i-1]
+                    else min(raw_upper[i], upper[i-1]))
+        # Lower band: only rise, unless previous close broke below it
+        lower[i] = (raw_lower[i] if close[i-1] < lower[i-1]
+                    else max(raw_lower[i], lower[i-1]))
 
-    macd = ta.trend.MACD(
-        df["close"], window_fast=MACD_FAST, window_slow=MACD_SLOW, window_sign=MACD_SIGNAL
-    )
-    df["macd"] = macd.macd()
-    df["macd_signal"] = macd.macd_signal()
-    df["macd_hist"] = macd.macd_diff()
-
-    df["atr"] = ta.volatility.average_true_range(df["high"], df["low"], df["close"], window=ATR_PERIOD)
-    df["atr_pct"] = df["atr"] / df["close"]
-
-    # NEW: ADX — trend strength filter; ADX < ADX_MIN = choppy/ranging market, skip entries
-    adx_ind = ta.trend.ADXIndicator(df["high"], df["low"], df["close"], window=14)
-    df["adx"] = adx_ind.adx()
-
-    # NEW: rolling VWAP (20-candle window) — approximates intraday institutional fair value
-    # On 15m, 20 candles = 5h of price action; used as bull/bear bias gate for MomentumBurst
-    df["typical_price"] = (df["high"] + df["low"] + df["close"]) / 3
-    df["vwap"] = (
-        (df["typical_price"] * df["volume"]).rolling(20).sum()
-        / df["volume"].rolling(20).sum()
-    )
-
-    # NEW: choppiness metric — 3-candle price range / close; low value = sideways market
-    df["chop_range"] = (
-        df["high"].rolling(3).max() - df["low"].rolling(3).min()
-    ) / df["close"]
-
-    df["vol_avg"] = df["volume"].rolling(20).mean()
-    df["vol_spike"] = df["volume"] > df["vol_avg"] * BREAKOUT_VOL_MULT
-
-    df["body"] = (df["close"] - df["open"]).abs()
-    df["body_avg"] = df["body"].rolling(20).mean()
-    df["bullish_candle"] = df["close"] > df["open"]
-    df["bearish_candle"] = df["close"] < df["open"]
-    df["strong_bullish"] = df["bullish_candle"] & (df["body"] > df["body_avg"] * STRONG_BODY_MULT)
-    df["strong_bearish"] = df["bearish_candle"] & (df["body"] > df["body_avg"] * STRONG_BODY_MULT)
-
-    df["recent_high"] = df["high"].shift(1).rolling(BREAKOUT_LOOKBACK).max()
-    df["recent_low"] = df["low"].shift(1).rolling(BREAKOUT_LOOKBACK).min()
-    return df
-
-
-
-def get_crypto_regime(symbol):
-    try:
-        df = add_indicators(fetch_crypto(symbol, CRYPTO_HTF, 250))
-        last = df.iloc[-1]
-        prev = df.iloc[-2]
-        fast_above = safe_float(last["ema_fast"]) > safe_float(last["ema_slow"])
-        fast_below = safe_float(last["ema_fast"]) < safe_float(last["ema_slow"])
-        slow_rising = safe_float(last["ema_slow"]) > safe_float(prev["ema_slow"])
-        slow_falling = safe_float(last["ema_slow"]) < safe_float(prev["ema_slow"])
-        atr_pct = safe_float(last["atr_pct"])
-
-        regime_up = fast_above and slow_rising and atr_pct >= REGIME_MIN_ATR_PCT
-        regime_down = fast_below and slow_falling and atr_pct >= REGIME_MIN_ATR_PCT
-        regime_not_bearish = fast_above or slow_rising
-        regime_not_bullish = fast_below or slow_falling
-
-        # Macro bull filter: price above 200-bar EMA on 4h = sustained uptrend, block shorts
-        ema_200 = ta.trend.ema_indicator(df["close"], window=200)
-        macro_bull = safe_float(last["close"]) > safe_float(ema_200.iloc[-1])
-
-        if fast_above:
-            trend_label = "UP"
-        elif fast_below and slow_falling:
-            trend_label = "DOWN"
-        elif not fast_above and slow_rising:
-            trend_label = "RECOVERING"
+        if   direction[i-1] == -1 and close[i] > upper[i-1]:
+            direction[i] =  1
+        elif direction[i-1] ==  1 and close[i] < lower[i-1]:
+            direction[i] = -1
         else:
-            trend_label = "NEUTRAL"
+            direction[i] = direction[i-1]
 
-        return {
-            "label": trend_label, "up": regime_up, "down": regime_down,
-            "not_bearish": regime_not_bearish, "not_bullish": regime_not_bullish,
-            "slow_rising": slow_rising, "slow_falling": slow_falling, "atr_pct": atr_pct,
-            "macro_bull": macro_bull,
-        }
+    line = np.where(direction == 1, lower, upper)
+    return pd.Series(line, index=df.index), pd.Series(direction, index=df.index)
+
+
+def get_btc_bull():
+    """True when BTC daily EMA20 > EMA50 (regime is bullish)."""
+    try:
+        df    = fetch_ohlcv(BTC_SYMBOL, TIMEFRAME, 200)
+        ema_f = ta.trend.ema_indicator(df["close"], window=EMA_FAST)
+        ema_s = ta.trend.ema_indicator(df["close"], window=EMA_SLOW)
+        return bool(safe_float(ema_f.iloc[-1]) > safe_float(ema_s.iloc[-1]))
     except Exception:
-        return {"label": "NEUTRAL", "up": False, "down": False, "not_bearish": False,
-                "not_bullish": False, "slow_rising": False, "slow_falling": False,
-                "atr_pct": 0.0, "macro_bull": True}
-
-
-
-def get_crypto_signal(df, regime, prev_regime_state):
-    if len(df) < max(MACD_SLOW + 10, BREAKOUT_LOOKBACK + 5):
-        return {"signal": "HOLD", "strategy": "none", "direction": "", "price": safe_float(df["close"].iloc[-1]), "atr": 0.0, "rsi": 50.0}
-
-    prev = df.iloc[-2]
-    last = df.iloc[-1]
-    price = safe_float(last["close"])
-    atr = safe_float(last["atr"])
-    rsi = safe_float(last["rsi"], 50.0)
-    rsi_prev = safe_float(last["rsi_prev"], 50.0)
-
-    # ── Trend-quality gates (NEW) ─────────────────────────────────────────────
-    adx = safe_float(last["adx"], 0.0)
-    adx_strong = adx >= ADX_MIN                     # below = choppy/ranging, reject all entries
-    vwap = safe_float(last["vwap"])
-    price_above_vwap = price > vwap and vwap > 0    # institutional fair-value bias
-    price_below_vwap = price < vwap and vwap > 0
-    chop = safe_float(last["chop_range"], 1.0)
-    not_choppy = chop >= CHOP_RANGE_MIN             # 3-candle range must show meaningful movement
-
-    ema_cross_up = safe_float(prev["ema_fast"]) < safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) > safe_float(last["ema_slow"])
-    ema_cross_down = safe_float(prev["ema_fast"]) > safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) < safe_float(last["ema_slow"])
-    ema_already_above = safe_float(last["ema_fast"]) > safe_float(last["ema_slow"])
-    ema_already_below = safe_float(last["ema_fast"]) < safe_float(last["ema_slow"])
-
-    macd_bullish = safe_float(last["macd"]) > safe_float(last["macd_signal"]) and safe_float(last["macd_hist"]) > 0
-    macd_bearish = safe_float(last["macd"]) < safe_float(last["macd_signal"]) and safe_float(last["macd_hist"]) < 0
-    macd_improving = safe_float(last["macd_hist"]) > safe_float(prev["macd_hist"])
-    macd_worsening = safe_float(last["macd_hist"]) < safe_float(prev["macd_hist"])
-
-    regime_just_flipped_up = regime["up"] and not prev_regime_state.get("up", False)
-    regime_just_flipped_down = regime["down"] and not prev_regime_state.get("down", False)
-    macro_bull = regime.get("macro_bull", True)
-
-    # ══ MOMENTUM BURST (NEW — earliest entry, 1-2 candles before EMA crossover) ═
-    # LONG burst: RSI was oversold (< 42), now crossing up through 52+, confirmed by
-    # price crossing above rolling VWAP with a volume spike.  This fires while EMA
-    # lines are still converging, capturing the bulk of the $500-1500 BTC impulse.
-    momentum_burst_buy = (
-        rsi_prev < 42 and rsi >= 52           # RSI escaping oversold territory
-        and price_above_vwap                  # price just crossed above institutional fair value
-        and bool(last["vol_spike"])           # volume confirming real participation
-        and adx_strong and not_choppy         # market actually trending, not ranging
-        and regime["up"]                      # 4h HTF regime confirms bull direction
-        and rsi < 68                          # not already overbought
-    )
-    # SHORT burst: RSI was overbought (> 58), now crossing down through 48-, price
-    # below VWAP.  Symmetric mirror of momentum_burst_buy.
-    momentum_burst_short = (
-        rsi_prev > 58 and rsi <= 48           # RSI escaping overbought territory
-        and price_below_vwap                  # price just crossed below institutional fair value
-        and bool(last["vol_spike"])
-        and adx_strong and not_choppy
-        and regime["down"]                    # 4h HTF regime confirms bear direction
-        and rsi > 32
-        and not macro_bull
-    )
-
-    # ══ BULLISH (LONG) ════════════════════════════════
-    # All legacy signals now also require adx_strong + not_choppy to filter ranging markets.
-    # RSI < 65: avoid entering longs in overbought conditions
-    trend_buy = ema_cross_up and macd_bullish and regime["up"] and rsi < 65 and adx_strong and not_choppy
-    # Breakout requires regime["up"] — stronger filter vs old regime["not_bearish"]
-    breakout_buy = (price > safe_float(last["recent_high"]) and bool(last["strong_bullish"])
-                    and bool(last["vol_spike"]) and regime["up"] and rsi < 65
-                    and adx_strong and not_choppy)
-    prev_near_ema = safe_float(prev["close"]) <= safe_float(prev["ema_fast"]) * (1 + PULLBACK_BUFFER)
-    rebound_candle = bool(last["bullish_candle"]) and price > safe_float(last["ema_fast"]) and price > safe_float(prev["high"])
-    pullback_buy = regime["up"] and prev_near_ema and rebound_candle and macd_improving and rsi < 65 and adx_strong and not_choppy
-    regimeflip_buy = regime_just_flipped_up and ema_already_above and macd_bullish and rsi < 65 and adx_strong
-
-    # ══ BEARISH (SHORT) ═══════════════════════════════
-    # macro_bull: price above 200-bar 4h EMA = sustained uptrend → block all shorts
-    # RSI > 35: avoid entering shorts in oversold conditions
-    short_trend = ema_cross_down and macd_bearish and regime["down"] and rsi > 35 and not macro_bull and adx_strong and not_choppy
-    # BUG-FIX #8: requires regime["down"] not regime["not_bullish"] for symmetry with breakout_buy
-    short_breakout = (price < safe_float(last["recent_low"]) and bool(last["strong_bearish"])
-                      and bool(last["vol_spike"]) and regime["down"] and rsi > 35
-                      and not macro_bull and adx_strong and not_choppy)
-    prev_near_ema_above = safe_float(prev["close"]) >= safe_float(prev["ema_fast"]) * (1 - PULLBACK_BUFFER)
-    rejection_candle = bool(last["bearish_candle"]) and price < safe_float(last["ema_fast"]) and price < safe_float(prev["low"])
-    short_pullback = regime["down"] and prev_near_ema_above and rejection_candle and macd_worsening and rsi > 35 and not macro_bull and adx_strong and not_choppy
-    short_regimeflip = regime_just_flipped_down and ema_already_below and macd_bearish and rsi > 35 and not macro_bull and adx_strong
-
-    # MomentumBurst has priority — it fires earliest in the move (before EMA crossover)
-    if momentum_burst_buy:   return {"signal": "BUY",   "strategy": "MomentumBurst",      "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
-    if momentum_burst_short: return {"signal": "SHORT", "strategy": "ShortMomentumBurst", "direction": "short", "price": price, "atr": atr, "rsi": rsi}
-    if trend_buy:        return {"signal": "BUY",   "strategy": "Trend",           "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
-    if breakout_buy:     return {"signal": "BUY",   "strategy": "Breakout",        "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
-    if pullback_buy:     return {"signal": "BUY",   "strategy": "Pullback",        "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
-    if regimeflip_buy:   return {"signal": "BUY",   "strategy": "RegimeFlip",      "direction": "long",  "price": price, "atr": atr, "rsi": rsi}
-    if short_trend:      return {"signal": "SHORT", "strategy": "ShortTrend",      "direction": "short", "price": price, "atr": atr, "rsi": rsi}
-    if short_breakout:   return {"signal": "SHORT", "strategy": "ShortBreakout",   "direction": "short", "price": price, "atr": atr, "rsi": rsi}
-    if short_pullback:   return {"signal": "SHORT", "strategy": "ShortPullback",   "direction": "short", "price": price, "atr": atr, "rsi": rsi}
-    if short_regimeflip: return {"signal": "SHORT", "strategy": "ShortRegimeFlip", "direction": "short", "price": price, "atr": atr, "rsi": rsi}
-    # NOTE: SELL/COVER signal exits removed — trades close via ATR stop or TP only.
-    return {"signal": "HOLD", "strategy": "none", "direction": "", "price": price, "atr": atr, "rsi": rsi}
+        return True   # fail-safe: allow trading if BTC data unavailable
 
 
 # ══════════════════════════════════════════════════════════════
-#  POSITION SIZING
+#  TRADE EXECUTION
 # ══════════════════════════════════════════════════════════════
 
-def calc_position_size(balance, price, atr, stop_atr_mult):
-    risk_amount = balance * RISK
-    if atr > 0:
-        stop_distance = atr * stop_atr_mult
-        qty = risk_amount / stop_distance if stop_distance > 0 else 0
-        spend = min(qty * price, balance * 0.25)
-        spend = max(spend, 1.0)
-    else:
-        spend = max(risk_amount, 1.0)
-    return round(spend, 2)
-
-
-# ══════════════════════════════════════════════════════════════
-#  PAPER TRADING - CRYPTO
-# ══════════════════════════════════════════════════════════════
-
-def crypto_buy(symbol, price, rsi, atr, strategy):
-    p = crypto_paper[symbol]
-    if p["in_trade"]:
-        return
-    spend = calc_position_size(p["balance"], price, atr, CRYPTO_STOP_ATR)
-    if spend < 1.0 or spend > p["balance"]:
+def open_trade(symbol, price, atr):
+    """
+    Open a long position.
+    Position sized so a 2×ATR adverse move = exactly RISK_PCT of current equity.
+    """
+    pos = positions[symbol]
+    if pos["in_trade"]:
         return
 
-    # Deduct entry fee
-    entry_fee = spend * TRADING_FEE_PCT
-    coin_qty = (spend - entry_fee) / price  # fee reduces how much coin you get
-    stop_price = price - (atr * CRYPTO_STOP_ATR) if atr > 0 else price * 0.99
-    tp_price = price + (atr * CRYPTO_TP_ATR) if atr > 0 else price * 1.02
+    equity       = get_equity()
+    risk_dollars = equity * RISK_PCT
+    stop_dist    = SL_ATR * atr
+    if stop_dist <= 0:
+        return
 
-    p["balance"] -= spend
-    p["coin_held"] = coin_qty
-    p["in_trade"] = True
-    p["trade_direction"] = "long"
-    p["entry_price"] = price
-    p["entry_atr"] = atr
-    p["stop_price"] = stop_price
-    p["tp_price"] = tp_price
-    p["entry_strategy"] = strategy
-    p["highest_price"] = price
+    qty  = risk_dollars / stop_dist     # coins to buy
+    cost = qty * price
+    fee  = cost * TRADING_FEE_PCT
+
+    if cost + fee > portfolio["balance"]:
+        coin = symbol.split("/")[0]
+        logging.warning(
+            f"  {coin}: insufficient cash  "
+            f"(need ${cost+fee:.2f}, have ${portfolio['balance']:.2f})"
+        )
+        return
+
+    stop_price = price - stop_dist
+    tp_price   = price + TP_ATR * atr
+
+    portfolio["balance"] -= (cost + fee)
+    pos.update({
+        "in_trade":    True,
+        "coin_held":   qty,
+        "entry_price": price,
+        "entry_atr":   atr,
+        "stop_price":  stop_price,
+        "tp_price":    tp_price,
+        "entry_time":  datetime.now(),
+    })
 
     coin = symbol.split("/")[0]
     msg = (
-        f"🟢 <b>LONG {coin}</b>\n"
-        f"Strategy: {strategy}\n"
+        f"🟢 <b>BUY {coin}</b> — Supertrend ↑ + BTC Bull\n"
         f"Price:   ${price:,.2f}\n"
-        f"Spent:   ${spend:.2f} (fee: ${entry_fee:.2f})\n"
-        f"Amount:  {coin_qty:.6f} {coin}\n"
-        f"RSI:     {rsi:.1f} | ATR: ${atr:.2f}\n"
-        f"Balance: ${p['balance']:,.2f}\n"
-        f"Stop: ${stop_price:,.2f} | TP: ${tp_price:,.2f}"
+        f"Qty:     {qty:.6f} {coin}  (cost ${cost:.2f})\n"
+        f"ATR:     ${atr:.2f}\n"
+        f"Stop:    ${stop_price:,.2f}  (-{SL_ATR}×ATR)\n"
+        f"Target:  ${tp_price:,.2f}  (+{TP_ATR}×ATR)\n"
+        f"Risk:    ${risk_dollars:.2f}  ({RISK_PCT*100:.0f}% equity)\n"
+        f"Cash:    ${portfolio['balance']:,.2f}"
     )
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>','').replace('</b>','')}")
     send_telegram(msg)
 
 
-
-def crypto_short(symbol, price, rsi, atr, strategy):
-    """Open a short position — bet on price going DOWN."""
-    p = crypto_paper[symbol]
-    if p["in_trade"]:
-        return
-    spend = calc_position_size(p["balance"], price, atr, CRYPTO_STOP_ATR)
-    if spend < 1.0 or spend > p["balance"]:
+def close_trade(symbol, price, reason="Signal"):
+    """Close the open long position for a symbol."""
+    pos = positions[symbol]
+    if not pos["in_trade"]:
         return
 
-    entry_fee = spend * TRADING_FEE_PCT
-    coin_qty = (spend - entry_fee) / price
-    stop_price = price + (atr * CRYPTO_STOP_ATR) if atr > 0 else price * 1.01
-    tp_price = price - (atr * CRYPTO_TP_ATR) if atr > 0 else price * 0.98
+    proceeds = pos["coin_held"] * price
+    fee      = proceeds * TRADING_FEE_PCT
+    pnl      = (proceeds - fee) - (pos["coin_held"] * pos["entry_price"])
 
-    p["balance"] -= spend
-    p["coin_held"] = coin_qty
-    p["in_trade"] = True
-    p["trade_direction"] = "short"
-    p["entry_price"] = price
-    p["entry_atr"] = atr
-    p["stop_price"] = stop_price
-    p["tp_price"] = tp_price
-    p["entry_strategy"] = strategy
-    p["lowest_price"] = price
-
-    coin = symbol.split("/")[0]
-    msg = (
-        f"🔴 <b>SHORT {coin}</b>\n"
-        f"Strategy: {strategy}\n"
-        f"Price:   ${price:,.2f}\n"
-        f"Spent:   ${spend:.2f} (fee: ${entry_fee:.2f})\n"
-        f"Amount:  {coin_qty:.6f} {coin}\n"
-        f"RSI:     {rsi:.1f} | ATR: ${atr:.2f}\n"
-        f"Balance: ${p['balance']:,.2f}\n"
-        f"Stop: ${stop_price:,.2f} | TP: ${tp_price:,.2f}"
-    )
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
-    send_telegram(msg)
-
-
-def crypto_partial_close(symbol, price, reason="Partial TP"):
-    """
-    Sell exactly 50% of the current coin_held at `price`.
-    Updates balance, logs the partial exit, and marks half_sold = True.
-    Does NOT mark in_trade = False — the remaining half stays open.
-    """
-    p = crypto_paper[symbol]
-    if not p["in_trade"] or p["half_sold"]:
-        return
-
-    direction = p["trade_direction"]
-    half_qty  = p["coin_held"] / 2.0
-    coin      = symbol.split("/")[0]
-
-    if direction == "long":
-        proceeds  = half_qty * price
-        exit_fee  = proceeds * TRADING_FEE_PCT
-        pnl       = (proceeds - exit_fee) - (half_qty * p["entry_price"])
-        p["balance"] += proceeds - exit_fee
-    elif direction == "short":
-        raw_pnl  = half_qty * (p["entry_price"] - price)
-        exit_fee = half_qty * price * TRADING_FEE_PCT
-        pnl      = raw_pnl - exit_fee
-        p["balance"] += half_qty * p["entry_price"] + pnl
-    else:
-        proceeds  = half_qty * price
-        exit_fee  = proceeds * TRADING_FEE_PCT
-        pnl       = (proceeds - exit_fee) - (half_qty * p["entry_price"])
-        p["balance"] += proceeds - exit_fee
-
-    p["coin_held"] -= half_qty
-    p["half_sold"]  = True
-    p["total_pnl"] += pnl
-
-    dir_label = "PARTIAL LONG" if direction == "long" else "PARTIAL SHORT"
-    msg = (
-        f"⚡ <b>{dir_label} {coin}</b> ({reason})\n"
-        f"Sold 50% at: ${price:,.2f}\n"
-        f"Fee:         ${exit_fee:.2f}\n"
-        f"Partial P&L: ${pnl:+.2f}\n"
-        f"Remaining:   {p['coin_held']:.6f} {coin}\n"
-        f"Balance:     ${p['balance']:,.2f}"
-    )
-    logging.info(f"  {coin} partial close at ${price:,.2f} | P&L ${pnl:+.2f}")
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
-    send_telegram(msg)
-
-
-def crypto_close(symbol, price, reason="Signal"):
-    """Close any open position — works for both long and short. Deducts exit fee."""
-    p = crypto_paper[symbol]
-    if not p["in_trade"]:
-        return
-
-    direction = p["trade_direction"]
-
-    if direction == "long":
-        proceeds = p["coin_held"] * price
-        exit_fee = proceeds * TRADING_FEE_PCT
-        proceeds_after_fee = proceeds - exit_fee
-        pnl = proceeds_after_fee - (p["coin_held"] * p["entry_price"])
-        p["balance"] += proceeds_after_fee
-    elif direction == "short":
-        raw_pnl = p["coin_held"] * (p["entry_price"] - price)
-        exit_value = p["coin_held"] * price
-        exit_fee = exit_value * TRADING_FEE_PCT
-        pnl = raw_pnl - exit_fee
-        p["balance"] += p["coin_held"] * p["entry_price"] + pnl
-    else:
-        proceeds = p["coin_held"] * price
-        exit_fee = proceeds * TRADING_FEE_PCT
-        pnl = (proceeds - exit_fee) - (p["coin_held"] * p["entry_price"])
-        p["balance"] += proceeds - exit_fee
-
-    p["total_trades"] += 1
-    p["total_pnl"] += pnl
-    p["coin_held"] = 0.0
-    p["in_trade"] = False
-    p["trade_direction"] = ""
-    p["highest_price"] = 0.0
-    p["lowest_price"] = 999999.0
-    p["half_sold"] = False
-    p["entry_price"] = 0.0
-    p["entry_atr"] = 0.0
-    p["stop_price"] = 0.0
-    p["tp_price"] = 0.0
-    p["entry_strategy"] = ""
+    portfolio["balance"]      += proceeds - fee
+    portfolio["total_pnl"]    += pnl
+    portfolio["daily_pnl"]    += pnl
+    portfolio["total_trades"] += 1
 
     if pnl >= 0:
-        p["wins"] += 1
-        p["best_trade"] = max(p["best_trade"], pnl)
-        emoji = "✅"
-        res = f"WIN  +${pnl:.2f}"
+        portfolio["wins"] += 1
+        emoji, res = "✅", f"WIN  +${pnl:.2f}"
     else:
-        p["losses"] += 1
-        p["worst_trade"] = min(p["worst_trade"], pnl)
-        p["last_loss_time"] = datetime.now()
-        emoji = "❌"
-        res = f"LOSS -${abs(pnl):.2f}"
+        portfolio["losses"] += 1
+        emoji, res = "❌", f"LOSS -${abs(pnl):.2f}"
 
-    perf["trades"] += 1
-    perf["pnl"] += pnl
-    if pnl >= 0:
-        perf["wins"] += 1
-    else:
-        perf["losses"] += 1
-
-    wr = (p["wins"] / p["total_trades"] * 100) if p["total_trades"] > 0 else 0
-    coin = symbol.split("/")[0]
-    dir_label = "CLOSE LONG" if direction == "long" else "CLOSE SHORT" if direction == "short" else "CLOSE"
-    msg = (
-        f"{emoji} <b>{dir_label} {coin}</b> ({reason})\n"
-        f"Price:    ${price:,.2f}\n"
-        f"Fee:      ${exit_fee:.2f}\n"
-        f"Result:   {res}\n"
-        f"Balance:  ${p['balance']:,.2f}\n"
-        f"Win rate: {wr:.1f}% ({p['wins']}W/{p['losses']}L)\n"
-        f"Total P&L: ${p['total_pnl']:+.2f}"
+    held_days = (
+        (datetime.now() - pos["entry_time"]).days
+        if pos["entry_time"] else 0
     )
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
+    wr   = portfolio["wins"] / portfolio["total_trades"] * 100
+    coin = symbol.split("/")[0]
+
+    # Reset position state
+    pos.update({
+        "in_trade":    False,
+        "coin_held":   0.0,
+        "entry_price": 0.0,
+        "entry_atr":   0.0,
+        "stop_price":  0.0,
+        "tp_price":    0.0,
+        "entry_time":  None,
+    })
+
+    msg = (
+        f"{emoji} <b>CLOSE {coin}</b> ({reason})\n"
+        f"Price:     ${price:,.2f}\n"
+        f"Result:    {res}\n"
+        f"Held:      {held_days}d\n"
+        f"Win rate:  {wr:.1f}%  ({portfolio['wins']}W / {portfolio['losses']}L)\n"
+        f"Total P&L: ${portfolio['total_pnl']:+.2f}\n"
+        f"Cash:      ${portfolio['balance']:,.2f}"
+    )
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>','').replace('</b>','')}")
     send_telegram(msg)
 
 
+# ══════════════════════════════════════════════════════════════
+#  EXIT CHECKS  (run every 30-min cycle using live ticker price)
+# ══════════════════════════════════════════════════════════════
 
-def check_crypto_exits(symbol, price):
-    """
-    3-stage exit manager:
-
-    Stage 1 — Normal (half_sold = False, price not yet at 1.5×ATR profit):
-        Stop = entry - 1×ATR  |  TP = entry + 2.5×ATR
-        Breakeven lock: once price >= entry + 1×ATR, stop moves to entry.
-
-    Stage 2 — Partial close (triggered when price >= entry + 1.5×ATR):
-        • Sell 50% of position at current price
-        • Stop moves to entry (breakeven guarantee on remaining half)
-        • TP advances to highest_price + 1×ATR
-        • half_sold flag set to True
-
-    Stage 3 — Trailing (half_sold = True):
-        • As price makes new highs, trail stop = highest_price - 1×ATR
-        • TP = highest_price + 1×ATR
-        • Close remaining half when price hits trailing stop or new TP
-
-    Short positions mirror all of the above symmetrically.
-    """
-    p = crypto_paper[symbol]
-    if not p["in_trade"]:
+def check_exits(symbol):
+    pos = positions[symbol]
+    if not pos["in_trade"]:
+        return
+    try:
+        price = float(exchange.fetch_ticker(symbol)["last"])
+    except Exception:
         return
 
-    entry = p["entry_price"]
-    atr   = p["entry_atr"]
-    coin  = symbol.split("/")[0]
-
-    if atr <= 0:
-        # Safety: no ATR data — fall back to simple stop/TP
-        if p["trade_direction"] == "long":
-            if price <= p["stop_price"]:
-                crypto_close(symbol, price, reason="ATR stop")
-            elif price >= p["tp_price"]:
-                crypto_close(symbol, price, reason="ATR take profit")
-        elif p["trade_direction"] == "short":
-            if price >= p["stop_price"]:
-                crypto_close(symbol, price, reason="ATR stop")
-            elif price <= p["tp_price"]:
-                crypto_close(symbol, price, reason="ATR take profit")
-        return
-
-    # ── LONG ──────────────────────────────────────────────────────────────────
-    if p["trade_direction"] == "long":
-
-        # Always track new highs
-        if price > p["highest_price"]:
-            p["highest_price"] = price
-
-        if not p["half_sold"]:
-            # ── Stage 1: breakeven lock ──
-            if price >= entry + atr and p["stop_price"] < entry:
-                p["stop_price"] = entry
-                logging.info(f"  {coin} breakeven stop locked at ${entry:,.2f}")
-
-            # ── Stage 2: partial close at 1.5×ATR profit ──
-            if price >= entry + 1.5 * atr:
-                # Sell half
-                partial_price = price
-                crypto_partial_close(symbol, partial_price, reason="Partial TP (1.5×ATR)")
-
-                # Lock stop at entry (never lose on remaining half)
-                p["stop_price"] = entry
-                # Advance TP to highest + 1×ATR
-                p["tp_price"] = p["highest_price"] + atr
-                logging.info(
-                    f"  {coin} trailing activated | new SL=${p['stop_price']:,.2f} "
-                    f"| new TP=${p['tp_price']:,.2f}"
-                )
-                return  # skip remaining checks this tick
-
-            # Standard stop / TP while still in Stage 1
-            if price <= p["stop_price"]:
-                crypto_close(symbol, price, reason="ATR stop")
-            elif price >= p["tp_price"]:
-                crypto_close(symbol, price, reason="ATR take profit")
-
-        else:
-            # ── Stage 3: trail stop & TP with remaining half ──
-            # Trail stop = highest - 1×ATR (never move stop backward)
-            new_trail_stop = p["highest_price"] - atr
-            if new_trail_stop > p["stop_price"]:
-                p["stop_price"] = new_trail_stop
-                logging.info(f"  {coin} trailing stop raised to ${p['stop_price']:,.2f}")
-
-            # TP = highest + 1×ATR (keep advancing)
-            new_tp = p["highest_price"] + atr
-            if new_tp > p["tp_price"]:
-                p["tp_price"] = new_tp
-
-            if price <= p["stop_price"]:
-                crypto_close(symbol, price, reason="Trailing stop (remainder)")
-            elif price >= p["tp_price"]:
-                crypto_close(symbol, price, reason="Trailing TP (remainder)")
-
-    # ── SHORT ─────────────────────────────────────────────────────────────────
-    elif p["trade_direction"] == "short":
-
-        # Always track new lows
-        if price < p["lowest_price"]:
-            p["lowest_price"] = price
-
-        if not p["half_sold"]:
-            # ── Stage 1: breakeven lock ──
-            if price <= entry - atr and p["stop_price"] > entry:
-                p["stop_price"] = entry
-                logging.info(f"  {coin} breakeven stop locked at ${entry:,.2f}")
-
-            # ── Stage 2: partial close at 1.5×ATR profit (price dropped 1.5×ATR) ──
-            if price <= entry - 1.5 * atr:
-                partial_price = price
-                crypto_partial_close(symbol, partial_price, reason="Partial TP (1.5×ATR)")
-
-                # Lock stop at entry
-                p["stop_price"] = entry
-                # Advance TP to lowest - 1×ATR
-                p["tp_price"] = p["lowest_price"] - atr
-                logging.info(
-                    f"  {coin} short trailing activated | new SL=${p['stop_price']:,.2f} "
-                    f"| new TP=${p['tp_price']:,.2f}"
-                )
-                return
-
-            if price >= p["stop_price"]:
-                crypto_close(symbol, price, reason="ATR stop")
-            elif price <= p["tp_price"]:
-                crypto_close(symbol, price, reason="ATR take profit")
-
-        else:
-            # ── Stage 3: trail stop & TP (short) ──
-            new_trail_stop = p["lowest_price"] + atr
-            if new_trail_stop < p["stop_price"]:
-                p["stop_price"] = new_trail_stop
-                logging.info(f"  {coin} short trailing stop lowered to ${p['stop_price']:,.2f}")
-
-            new_tp = p["lowest_price"] - atr
-            if new_tp < p["tp_price"]:
-                p["tp_price"] = new_tp
-
-            if price >= p["stop_price"]:
-                crypto_close(symbol, price, reason="Trailing stop (remainder)")
-            elif price <= p["tp_price"]:
-                crypto_close(symbol, price, reason="Trailing TP (remainder)")
+    if price <= pos["stop_price"]:
+        close_trade(symbol, price, reason=f"Stop loss ({SL_ATR}×ATR)")
+    elif price >= pos["tp_price"]:
+        close_trade(symbol, price, reason=f"Take profit ({TP_ATR}×ATR)")
 
 
 # ══════════════════════════════════════════════════════════════
@@ -820,82 +353,53 @@ def check_crypto_exits(symbol, price):
 # ══════════════════════════════════════════════════════════════
 
 def send_daily_report():
-    total_equity = get_total_crypto_equity()
-    total_pnl = sum(p["total_pnl"] for p in crypto_paper.values())
-    total_w = sum(p["wins"] for p in crypto_paper.values())
-    total_l = sum(p["losses"] for p in crypto_paper.values())
-    total_t = total_w + total_l
-    wr = (total_w / total_t * 100) if total_t > 0 else 0
-    best = max(p["best_trade"] for p in crypto_paper.values())
-    worst = min(p["worst_trade"] for p in crypto_paper.values())
+    equity     = get_equity()
+    wr         = (portfolio["wins"] / portfolio["total_trades"] * 100
+                  if portfolio["total_trades"] > 0 else 0)
+    pct_return = (equity - INITIAL_BALANCE) / INITIAL_BALANCE * 100
+    open_pos   = [s.split("/")[0] for s, p in positions.items() if p["in_trade"]]
 
     msg = (
         f"📊 <b>Daily Report — {datetime.now().strftime('%b %d %Y')}</b>\n\n"
-        f"Equity:     ${total_equity:,.2f}\n"
-        f"Today P&L:  ${perf['pnl']:+.2f}\n"
-        f"Total P&L:  ${total_pnl:+.2f}\n\n"
-        f"Trades:     {total_t}\n"
-        f"Win rate:   {wr:.1f}% ({total_w}W / {total_l}L)\n"
-        f"Best trade: +${best:.2f}\n"
-        f"Worst trade: -${abs(worst):.2f}\n\n"
-        f"{'⚠️ Daily loss limit was hit today' if perf['paused'] else '✅ No limits hit today'}"
+        f"Equity:       ${equity:,.2f}  ({pct_return:+.1f}% total)\n"
+        f"Today P&L:    ${portfolio['daily_pnl']:+.2f}\n"
+        f"Total P&L:    ${portfolio['total_pnl']:+.2f}\n\n"
+        f"Trades:       {portfolio['total_trades']}\n"
+        f"Win rate:     {wr:.1f}%  ({portfolio['wins']}W / {portfolio['losses']}L)\n"
+        f"Cash on hand: ${portfolio['balance']:,.2f}\n"
+        f"Open trades:  {', '.join(open_pos) if open_pos else 'None'}"
     )
     send_telegram(msg)
-    print(f"\n{'='*55}\nDAILY REPORT SENT\n{'='*55}")
-
+    print(f"\n{'='*58}\n{msg.replace('<b>','').replace('</b>','')}\n{'='*58}")
 
 
 def schedule_daily_report():
     while True:
-        now = datetime.now()
-        next_midnight = (now + timedelta(days=1)).replace(hour=0, minute=0, second=0, microsecond=0)
-        sleep_secs = (next_midnight - now).total_seconds()
-        time.sleep(sleep_secs)
+        now          = datetime.now()
+        next_report  = (now + timedelta(days=1)).replace(
+            hour=0, minute=1, second=0, microsecond=0
+        )
+        time.sleep((next_report - now).total_seconds())
         send_daily_report()
+        portfolio["daily_pnl"]   = 0.0
+        portfolio["daily_date"]  = datetime.now().date()
+        portfolio["daily_start"] = get_equity()
 
 
 # ══════════════════════════════════════════════════════════════
-#  REGIME WARMUP  (prevents false RegimeFlip trades on restart)
+#  MAIN LOOP
 # ══════════════════════════════════════════════════════════════
 
-def warmup_regime():
-    """
-    Pre-populate prev_regime with the actual live regime state before the
-    main loop starts.  Without this, every symbol starts as up=False so the
-    very first iteration falsely triggers regime_just_flipped_up for any
-    coin that is already in an UP regime, firing a bad RegimeFlip entry.
-    """
-    print("Warming up regime state...")
-    for symbol in CRYPTO_SYMBOLS:
-        try:
-            regime = get_crypto_regime(symbol)
-            prev_regime[symbol] = {"up": regime["up"], "down": regime["down"]}
-            coin = symbol.split("/")[0]
-            print(f"  {coin}: {regime['label']} | macro_bull={regime['macro_bull']} "
-                  f"| up={regime['up']} | down={regime['down']}")
-        except Exception as e:
-            print(f"  {symbol} warmup failed: {e}")
-    print("Regime warmup complete.\n")
-
-
-# ══════════════════════════════════════════════════════════════
-#  CRYPTO MAIN LOOP
-# ══════════════════════════════════════════════════════════════
-
-def run_crypto():
-    warmup_regime()   # BUG-FIX: pre-populate regime state to avoid false RegimeFlip on restart
-    coins = ", ".join(s.split("/")[0] for s in CRYPTO_SYMBOLS)
+def run_bot():
+    coins = ", ".join(s.split("/")[0] for s in SYMBOLS)
     msg = (
-        f"🤖 <b>Crypto bot started</b>\n"
-        f"Coins:     {coins}\n"
-        f"Timeframe: {CRYPTO_TF}  |  HTF: {CRYPTO_HTF}\n"
-        f"Long:      MomentumBurst + Trend + Breakout + Pullback + RegimeFlip\n"
-        f"Short:     ShortMomentumBurst + ShortTrend + ShortBreakout + ShortPullback + ShortRegimeFlip\n"
-        f"Risk:      Stop {CRYPTO_STOP_ATR} ATR | TP {CRYPTO_TP_ATR} ATR\n"
-        f"Filters:   ADX≥{ADX_MIN} | Chop≥{CHOP_RANGE_MIN*100:.1f}% | VWAP-bias | macro_bull shorts block\n"
-        f"Fee:       {TRADING_FEE_PCT*100:.2f}% per trade (Binance US taker)\n"
-        f"Daily limit: {DAILY_LOSS_LIMIT*100:.0f}%  |  Cooldown: {COOLDOWN_MINUTES}min\n"
-        f"Balance:   ${CRYPTO_BAL:,.2f}  (paper)"
+        f"🤖 <b>Supertrend Daily Bot started</b>\n"
+        f"Strategy: Supertrend({ST_PERIOD}, {ST_MULT}) + BTC EMA{EMA_FAST}/{EMA_SLOW} filter\n"
+        f"Coins:    {coins}\n"
+        f"Long-only  |  TP: {TP_ATR}×ATR  |  SL: {SL_ATR}×ATR\n"
+        f"Risk: {RISK_PCT*100:.0f}% per trade  |  Fee: {TRADING_FEE_PCT*100:.2f}%\n"
+        f"Backtest: $1,000 → $2,220 (+29.3%/yr) Jan 2022–Apr 2026\n"
+        f"Balance:  ${INITIAL_BALANCE:,.2f}  (paper trading)"
     )
     print("=" * 58)
     print(msg.replace("<b>", "").replace("</b>", ""))
@@ -904,357 +408,84 @@ def run_crypto():
 
     while True:
         try:
-            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking crypto...")
-            if perf["paused"]:
-                reset_daily_stats()
-                if perf["paused"]:
-                    time.sleep(CHECK_INTERVAL)
-                    continue
-                print("New day — resuming trading")
+            print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Checking...")
+            reset_daily_if_needed()
 
-            for symbol in CRYPTO_SYMBOLS:
+            # ── Step 1: check TP/SL exits with live prices every cycle ──
+            for symbol in SYMBOLS:
+                check_exits(symbol)
+
+            # ── Step 2: get BTC regime once (same for all coins) ──
+            btc_bull = get_btc_bull()
+            regime_lbl = "🟢 BTC-BULL" if btc_bull else "🔴 BTC-BEAR"
+            print(f"  Regime: {regime_lbl}")
+
+            # ── Step 3: check each coin for new daily candle signals ──
+            for symbol in SYMBOLS:
                 coin = symbol.split("/")[0]
                 try:
-                    df = add_indicators(fetch_crypto(symbol, CRYPTO_TF, 250))
-                    last = df.iloc[-1]
-                    price = safe_float(last["close"])
-                    # BUG-FIX: use live ticker for exits so intra-candle stops fire immediately
-                    live_price = get_live_price(symbol) or price
-                    last_seen_prices[symbol] = live_price
-                    check_crypto_exits(symbol, live_price)
+                    df   = fetch_ohlcv(symbol, TIMEFRAME, 200)
+                    atr  = ta.volatility.average_true_range(
+                        df["high"], df["low"], df["close"], window=ATR_PERIOD
+                    )
+                    _, st_dir = compute_supertrend(df, ST_PERIOD, ST_MULT)
 
-                    candle_ts = df.index[-1]
-                    if candle_ts == last_candle_ts[symbol]:
-                        continue
-                    last_candle_ts[symbol] = candle_ts
+                    candle_ts   = df.index[-1]
+                    cur_dir     = int(st_dir.iloc[-1])
+                    prev_dir    = int(st_dir.iloc[-2])
+                    cur_atr     = safe_float(atr.iloc[-1])
+                    price       = safe_float(df["close"].iloc[-1])
+                    is_new      = (candle_ts != last_candle_ts[symbol])
 
-                    regime = get_crypto_regime(symbol)
-                    sig = get_crypto_signal(df, regime, prev_regime[symbol])
-                    prev_regime[symbol] = {"up": regime["up"], "down": regime["down"]}
-                    p = crypto_paper[symbol]
-                    macd_dir = "↑" if safe_float(last["macd_hist"]) > 0 else "↓"
-
-                    if p["in_trade"]:
-                        dir_label = "LONG" if p["trade_direction"] == "long" else "SHORT"
-                        st = f"IN {dir_label}"
-                    else:
-                        st = "watching"
+                    st_lbl   = "↑BULL" if cur_dir == 1 else "↓BEAR"
+                    pos_lbl  = "IN TRADE" if positions[symbol]["in_trade"] else "watching"
 
                     print(
-                        f"  {coin:<4} | {sig['signal']:<5} | {sig['strategy']:<14} | "
-                        f"4h:{regime['label']:<10} | MACD:{macd_dir} | "
-                        f"ATR%:{regime['atr_pct']*100:>4.2f} | ${sig['price']:>10,.2f} | {st}"
+                        f"  {coin:<4} | ST:{st_lbl} | ATR:${cur_atr:,.2f} | "
+                        f"${price:,.2f} | {pos_lbl}"
+                        + (" [NEW CANDLE]" if is_new else "")
                     )
 
-                    if not p["in_trade"] and is_trading_allowed(symbol):
-                        # BUG-FIX: removed stale outer Breakout/ShortBreakout guards — all
-                        # entry filters are already enforced inside get_crypto_signal().
-                        if sig["signal"] == "BUY":
-                            crypto_buy(symbol, sig["price"], sig["rsi"], sig["atr"], sig["strategy"])
-                        elif sig["signal"] == "SHORT":
-                            crypto_short(symbol, sig["price"], sig["rsi"], sig["atr"], sig["strategy"])
-                    # Trades exit via ATR stop / TP only (check_crypto_exits above).
+                    if not is_new:
+                        continue   # same candle — only check exits (done above)
+
+                    last_candle_ts[symbol] = candle_ts
+                    pos = positions[symbol]
+
+                    flipped_bull = (cur_dir == 1  and prev_dir == -1)
+                    flipped_bear = (cur_dir == -1 and prev_dir ==  1)
+
+                    # ── ENTRY ──────────────────────────────────────────────
+                    # Supertrend just turned bullish AND BTC regime is bullish
+                    if flipped_bull and btc_bull and not pos["in_trade"]:
+                        open_trade(symbol, price, cur_atr)
+
+                    # ── EXIT via signal ────────────────────────────────────
+                    # Supertrend just turned bearish — close the long
+                    elif flipped_bear and pos["in_trade"]:
+                        close_trade(symbol, price, reason="Supertrend turned bearish")
+
+                    # ── INFO: filtered signal ──────────────────────────────
+                    elif flipped_bull and not btc_bull:
+                        print(f"  {coin}: ST flipped bull but BTC is bearish — signal skipped")
+                        send_telegram(
+                            f"⚠️ <b>{coin}</b> Supertrend ↑ but BTC is bearish — skipped"
+                        )
 
                 except Exception as e:
                     print(f"  {coin} error: {e}")
 
         except Exception as e:
-            print(f"Crypto loop error: {e}")
+            print(f"Main loop error: {e}")
 
         time.sleep(CHECK_INTERVAL)
 
 
 # ══════════════════════════════════════════════════════════════
-#  STOCKS SETTINGS  ── DISABLED (commented out, logic preserved)
-# ══════════════════════════════════════════════════════════════
-
-# STOCK_SYMBOLS = ["SPY", "QQQ", "TSLA", "NVDA", "AMD"]
-# S_FAST_EMA = 10
-# S_SLOW_EMA = 50
-# STOCK_BAL = 10000.0
-# STOCK_SLEEP = 60 * 5
-# MARKET_OPEN_AVOID_MINS = 0
-# STOCK_STOP_ATR = 1.2
-# STOCK_TP_ATR = 2.5
-# STOCK_PULLBACK_BUFFER = 0.003
-#
-# ALPACA_KEY = os.getenv("ALPACA_API_KEY", "")
-# ALPACA_SECRET = os.getenv("ALPACA_SECRET_KEY", "")
-# ALPACA_URL = "https://paper-api.alpaca.markets"
-#
-# stock_paper = {
-#     s: {
-#         "balance": STOCK_BAL / len(STOCK_SYMBOLS),
-#         "shares_held": 0.0,
-#         "in_trade": False,
-#         "entry_price": 0.0,
-#         "entry_atr": 0.0,
-#         "stop_price": 0.0,
-#         "tp_price": 0.0,
-#         "entry_strategy": "",
-#         "highest_price": 0.0,
-#         "total_trades": 0,
-#         "wins": 0,
-#         "losses": 0,
-#         "last_loss_time": None,
-#         "total_pnl": 0.0,
-#     }
-#     for s in STOCK_SYMBOLS
-# }
-
-
-# ══════════════════════════════════════════════════════════════
-#  STOCKS FUNCTIONS  ── DISABLED (commented out, logic preserved)
-# ══════════════════════════════════════════════════════════════
-
-# def is_safe_trading_time(alpaca):
-#     try:
-#         clock = alpaca.get_clock()
-#         if not clock.is_open:
-#             return False
-#         now = pd.Timestamp(clock.timestamp).tz_convert("America/New_York")
-#         market_open = now.replace(hour=9, minute=30, second=0)
-#         market_close = now.replace(hour=16, minute=0, second=0)
-#         avoid_open = market_open + timedelta(minutes=MARKET_OPEN_AVOID_MINS)
-#         avoid_close = market_close - timedelta(minutes=MARKET_OPEN_AVOID_MINS)
-#         if now < avoid_open:
-#             print(f"  Time filter: too close to open ({MARKET_OPEN_AVOID_MINS}min buffer)")
-#             return False
-#         if now > avoid_close:
-#             print(f"  Time filter: too close to close ({MARKET_OPEN_AVOID_MINS}min buffer)")
-#             return False
-#         return True
-#     except Exception:
-#         return True
-#
-#
-# def add_stock_indicators(bars):
-#     bars = bars.copy()
-#     bars["ema_fast"] = ta.trend.ema_indicator(bars["close"], window=S_FAST_EMA)
-#     bars["ema_slow"] = ta.trend.ema_indicator(bars["close"], window=S_SLOW_EMA)
-#     bars["ema_200"] = ta.trend.ema_indicator(bars["close"], window=200)
-#     bars["atr"] = ta.volatility.average_true_range(bars["high"], bars["low"], bars["close"], window=ATR_PERIOD)
-#     bars["body"] = (bars["close"] - bars["open"]).abs()
-#     bars["bullish_candle"] = bars["close"] > bars["open"]
-#     bars["body_avg"] = bars["body"].rolling(20).mean()
-#     macd = ta.trend.MACD(bars["close"], window_fast=12, window_slow=26, window_sign=9)
-#     bars["macd"] = macd.macd()
-#     bars["macd_signal"] = macd.macd_signal()
-#     bars["macd_hist"] = macd.macd_diff()
-#     return bars
-#
-#
-# def stock_regime(last, prev):
-#     above_200 = safe_float(last["close"]) > safe_float(last["ema_200"])
-#     ema200_rising = safe_float(last["ema_200"]) > safe_float(prev["ema_200"])
-#     return {"up": above_200 and ema200_rising, "label": "UP" if above_200 else "DOWN", "ema200_rising": ema200_rising}
-#
-#
-# def get_stock_signal(bars):
-#     prev = bars.iloc[-2]
-#     last = bars.iloc[-1]
-#     regime = stock_regime(last, prev)
-#     ema_cross_up = safe_float(prev["ema_fast"]) < safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) > safe_float(last["ema_slow"])
-#     ema_cross_down = safe_float(prev["ema_fast"]) > safe_float(prev["ema_slow"]) and safe_float(last["ema_fast"]) < safe_float(last["ema_slow"])
-#     macd_bullish = safe_float(last["macd_hist"]) > 0
-#     macd_bearish = safe_float(last["macd_hist"]) < 0
-#     macd_improving = safe_float(last["macd_hist"]) > safe_float(prev["macd_hist"])
-#     trend_buy = ema_cross_up and macd_bullish and regime["up"]
-#     prev_near_ema = safe_float(prev["close"]) <= safe_float(prev["ema_fast"]) * (1 + STOCK_PULLBACK_BUFFER)
-#     rebound_candle = bool(last["bullish_candle"]) and safe_float(last["close"]) > safe_float(last["ema_fast"]) and safe_float(last["close"]) > safe_float(prev["high"])
-#     pullback_buy = regime["up"] and prev_near_ema and rebound_candle and macd_improving
-#     sell_signal = ema_cross_down and macd_bearish
-#     if trend_buy:    return "BUY",  "Trend",   regime
-#     if pullback_buy: return "BUY",  "Pullback", regime
-#     if sell_signal:  return "SELL", "Signal",   regime
-#     return "HOLD", "none", regime
-#
-#
-# def s_buy(symbol, price, atr, strategy):
-#     p = stock_paper[symbol]
-#     if p["in_trade"]:
-#         return
-#     spend = calc_position_size(p["balance"], price, atr, STOCK_STOP_ATR)
-#     if spend < 1.0 or spend > p["balance"]:
-#         return
-#     shares = spend / price
-#     stop_price = price - (atr * STOCK_STOP_ATR) if atr > 0 else price * 0.99
-#     tp_price = price + (atr * STOCK_TP_ATR) if atr > 0 else price * 1.02
-#     p["balance"] -= spend
-#     p["shares_held"] = shares
-#     p["in_trade"] = True
-#     p["entry_price"] = price
-#     p["entry_atr"] = atr
-#     p["stop_price"] = stop_price
-#     p["tp_price"] = tp_price
-#     p["entry_strategy"] = strategy
-#     p["highest_price"] = price
-#     msg = (
-#         f"🟢 <b>BUY {symbol}</b>\n"
-#         f"Strategy: {strategy}\n"
-#         f"Price:   ${price:,.2f}\n"
-#         f"Spent:   ${spend:.2f}\n"
-#         f"Shares:  {shares:.4f}\n"
-#         f"Balance: ${p['balance']:,.2f}\n"
-#         f"Stop: ${stop_price:,.2f} | TP: ${tp_price:,.2f}"
-#     )
-#     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
-#     send_telegram(msg)
-#
-#
-# def s_sell(symbol, price, reason="Signal"):
-#     p = stock_paper[symbol]
-#     if not p["in_trade"]:
-#         return
-#     proceeds = p["shares_held"] * price
-#     pnl = proceeds - (p["shares_held"] * p["entry_price"])
-#     p["balance"] += proceeds
-#     p["total_trades"] += 1
-#     p["total_pnl"] += pnl
-#     p["shares_held"] = 0.0
-#     p["in_trade"] = False
-#     p["highest_price"] = 0.0
-#     p["entry_price"] = 0.0
-#     p["entry_atr"] = 0.0
-#     p["stop_price"] = 0.0
-#     p["tp_price"] = 0.0
-#     p["entry_strategy"] = ""
-#     if pnl >= 0:
-#         p["wins"] += 1
-#         emoji = "✅"
-#         res = f"WIN  +${pnl:.2f}"
-#     else:
-#         p["losses"] += 1
-#         p["last_loss_time"] = datetime.now()
-#         emoji = "❌"
-#         res = f"LOSS -${abs(pnl):.2f}"
-#     wr = (p["wins"] / p["total_trades"] * 100) if p["total_trades"] > 0 else 0
-#     msg = (
-#         f"{emoji} <b>SELL {symbol}</b> ({reason})\n"
-#         f"Price:    ${price:,.2f}\n"
-#         f"Result:   {res}\n"
-#         f"Balance:  ${p['balance']:,.2f}\n"
-#         f"Win rate: {wr:.1f}% ({p['wins']}W/{p['losses']}L)\n"
-#         f"Total P&L: ${p['total_pnl']:+.2f}"
-#     )
-#     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg.replace('<b>', '').replace('</b>', '')}")
-#     send_telegram(msg)
-#
-#
-# def check_stock_exits(symbol, price):
-#     p = stock_paper[symbol]
-#     if not p["in_trade"]:
-#         return
-#     if price > p["highest_price"]:
-#         p["highest_price"] = price
-#     if price <= p["stop_price"]:
-#         s_sell(symbol, price, "ATR stop")
-#     elif price >= p["tp_price"]:
-#         s_sell(symbol, price, "ATR take profit")
-#
-#
-# def run_stocks():
-#     # To re-enable stocks: uncomment this entire function block and the thread in __main__
-#     if not ALPACA_KEY or not ALPACA_SECRET:
-#         print("Stocks bot: No Alpaca keys — skipping")
-#         return
-#     try:
-#         alpaca = REST(ALPACA_KEY, ALPACA_SECRET, ALPACA_URL)
-#         alpaca.get_account()
-#         print("Stocks bot: Alpaca connected!")
-#     except Exception as e:
-#         print(f"Stocks bot: connection failed — {e}")
-#         return
-#     msg = (
-#         f"📈 <b>Stocks bot started</b>\n"
-#         f"Stocks:   {', '.join(STOCK_SYMBOLS)}\n"
-#         f"Modes:    Trend + Pullback\n"
-#         f"Risk:     Stop {STOCK_STOP_ATR} ATR | TP {STOCK_TP_ATR} ATR\n"
-#         f"Time filter: avoid first/last {MARKET_OPEN_AVOID_MINS}min\n"
-#         f"Cooldown: {COOLDOWN_MINUTES}min after loss\n"
-#         f"Balance:  ${STOCK_BAL:,.2f}  (paper)"
-#     )
-#     print("=" * 58)
-#     print(msg.replace("<b>", "").replace("</b>", ""))
-#     print("=" * 58)
-#     send_telegram(msg)
-#     while True:
-#         try:
-#             clock = alpaca.get_clock()
-#             if not clock.is_open:
-#                 now = pd.Timestamp(clock.timestamp)
-#                 nxt = pd.Timestamp(clock.next_open)
-#                 mins = int((nxt - now).total_seconds() / 60)
-#                 print(f"[{datetime.now().strftime('%H:%M:%S')}] Market closed — {mins} min until open")
-#                 time.sleep(60 * 15)
-#                 continue
-#             if not is_safe_trading_time(alpaca):
-#                 time.sleep(60)
-#                 continue
-#             print(f"\n[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Market open — checking stocks...")
-#             import yfinance as yf
-#             for symbol in STOCK_SYMBOLS:
-#                 try:
-#                     bars = yf.Ticker(symbol).history(period="2y", interval="1d")
-#                     bars = bars.reset_index(drop=True)
-#                     bars.columns = [c.lower() for c in bars.columns]
-#                     if len(bars) < 220:
-#                         print(f"  {symbol:<4} | not enough bars — skipping")
-#                         continue
-#                     bars = add_stock_indicators(bars)
-#                     prev = bars.iloc[-2]
-#                     last = bars.iloc[-1]
-#                     price = safe_float(last["close"])
-#                     atr = safe_float(last["atr"])
-#                     signal, strategy, regime = get_stock_signal(bars)
-#                     p = stock_paper[symbol]
-#                     status = "IN TRADE" if p["in_trade"] else "watching"
-#                     macd_dir = "↑" if safe_float(last["macd_hist"]) > 0 else "↓"
-#                     check_stock_exits(symbol, price)
-#                     can_trade = True
-#                     if p["last_loss_time"]:
-#                         elapsed = (datetime.now() - p["last_loss_time"]).total_seconds() / 60
-#                         if elapsed < COOLDOWN_MINUTES:
-#                             can_trade = False
-#                     print(
-#                         f"  {symbol:<4} | {signal:<4} | {strategy:<8} | "
-#                         f"200:{regime['label']:<4} | MACD:{macd_dir} | ${price:>8,.2f} | {status}"
-#                     )
-#                     if signal == "BUY" and not p["in_trade"] and can_trade:
-#                         s_buy(symbol, price, atr, strategy)
-#                     elif signal == "SELL" and p["in_trade"]:
-#                         s_sell(symbol, price)
-#                     time.sleep(1)
-#                 except Exception as e:
-#                     print(f"  {symbol} error: {e}")
-#         except Exception as e:
-#             print(f"Stocks loop error: {e}")
-#         time.sleep(STOCK_SLEEP)
-
-
-# ══════════════════════════════════════════════════════════════
-#  MAIN
+#  ENTRY POINT
 # ══════════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
     threading.Thread(target=start_health_server, daemon=True).start()
-    print(f"Health server running on port {os.getenv('PORT', 8080)}")
-
-    time.sleep(2)
-    threading.Thread(target=run_crypto, daemon=True).start()
-    time.sleep(3)
-    # threading.Thread(target=run_stocks, daemon=True).start()  # STOCKS DISABLED — uncomment to re-enable
-    time.sleep(1)
     threading.Thread(target=schedule_daily_report, daemon=True).start()
-
-    print("All bots running.")
-
-    while True:
-        try:
-            time.sleep(30)
-        except KeyboardInterrupt:
-            print("Shutting down...")
-            break
-        except Exception as e:
-            print(f"Main thread error (continuing): {e}")
-            time.sleep(30)
+    run_bot()

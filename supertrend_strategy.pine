@@ -1,0 +1,242 @@
+// ============================================================================
+//  Daily Supertrend Buy Strategy - Pine Script v5  STRATEGY
+//  Supertrend(10, 3.0) + BTC EMA20/50 regime filter
+//  Long-only | TP = 5xATR from fill | SL = 2xATR from fill
+//  Initial capital $1,000 | Commission 0.1% per side
+//
+//  HOW TO USE:
+//    1. Open BTC, ETH, or SOL chart on DAILY timeframe
+//    2. Pine Editor -> paste this -> Add to chart
+//    3. Click "Strategy Tester" tab at bottom to see P&L results
+//    4. Green triangle  = BUY entry
+//    5. Gray  triangle  = signal filtered out (BTC bearish)
+//    6. Green dashed    = Take Profit level
+//    7. Red   dashed    = Stop Loss level
+// ============================================================================
+
+//@version=5
+strategy("Daily Supertrend Strategy (BTC-Filtered)",
+     overlay             = true,
+     initial_capital     = 1000,
+     currency            = currency.USD,
+     default_qty_type    = strategy.cash,
+     default_qty_value   = 1000,
+     commission_type     = strategy.commission.percent,
+     commission_value    = 0.1,
+     slippage            = 1,
+     pyramiding          = 0,
+     calc_on_every_tick  = false,
+     max_lines_count     = 500,
+     max_labels_count    = 500,
+     max_boxes_count     = 200)
+
+// ============================================================
+//  INPUTS
+// ============================================================
+
+var GRP1 = "Supertrend"
+st_len  = input.int(10,   "Supertrend Period",     minval=1,             group=GRP1)
+st_mult = input.float(3.0,"Supertrend Multiplier", minval=0.1, step=0.1, group=GRP1)
+
+var GRP2 = "Trade Levels & Risk"
+atr_len  = input.int(14,    "ATR Period",             minval=1,             group=GRP2)
+stop_x   = input.float(2.0, "Stop Loss  (x ATR)",     minval=0.1, step=0.1, group=GRP2)
+tp_x     = input.float(5.0, "Take Profit (x ATR)",    minval=0.1, step=0.1, group=GRP2)
+risk_pct = input.float(4.0, "Risk per Trade (%)",     minval=0.1, step=0.5, group=GRP2) / 100
+line_len = input.int(40,    "Extend Lines (bars)",     minval=5, maxval=300, group=GRP2)
+
+var GRP3 = "BTC Regime Filter"
+btc_sym  = input.symbol("BINANCE:BTCUSDT", "BTC Symbol", group=GRP3)
+ema_fast = input.int(20, "BTC EMA Fast", minval=1, group=GRP3)
+ema_slow = input.int(50, "BTC EMA Slow", minval=1, group=GRP3)
+
+var GRP4 = "Date Range Filter"
+use_date   = input.bool(false,                    "Enable Date Range Filter", group=GRP4)
+start_date = input.time(timestamp("2022-01-01"),  "Start Date",               group=GRP4, confirm=false)
+end_date   = input.time(timestamp("2030-12-31"),  "End Date",                 group=GRP4, confirm=false)
+
+var GRP5 = "Display"
+show_bg    = input.bool(true, "Shade Bull/Bear Background", group=GRP5)
+show_flt   = input.bool(true, "Show Filtered-Out Signals",  group=GRP5)
+show_box   = input.bool(true, "Show TP/SL Risk Box",        group=GRP5)
+show_table = input.bool(true, "Show Status Table",          group=GRP5)
+
+// ============================================================
+//  SUPERTREND
+// ============================================================
+
+[st_line, _dir] = ta.supertrend(st_mult, st_len)
+st_bull        = close > st_line
+st_turned_bull = st_bull and not st_bull[1]
+st_turned_bear = not st_bull and st_bull[1]
+
+// ============================================================
+//  BTC REGIME
+// ============================================================
+
+btc_c    = request.security(btc_sym, timeframe.period, close, lookahead=barmerge.lookahead_off)
+btc_ef   = ta.ema(btc_c, ema_fast)
+btc_es   = ta.ema(btc_c, ema_slow)
+btc_bull = btc_ef > btc_es
+
+// ============================================================
+//  PRE-COMPUTE  (all ta.* calls must run unconditionally)
+// ============================================================
+
+atr_val     = ta.atr(atr_len)
+btc_ef_disp = request.security(btc_sym, timeframe.period, ta.ema(close, ema_fast))
+btc_es_disp = request.security(btc_sym, timeframe.period, ta.ema(close, ema_slow))
+
+// ============================================================
+//  SIGNALS
+// ============================================================
+
+in_date_range = not use_date or (time >= start_date and time <= end_date)
+buy_signal    = st_turned_bull and btc_bull    and in_date_range
+buy_filtered  = st_turned_bull and not btc_bull and in_date_range
+
+// ============================================================
+//  STRATEGY ENTRIES & EXITS
+//  - Entry fills at NEXT BAR OPEN (Pine Script default)
+//  - profit/loss are in ticks relative to actual fill price
+//    so TP/SL stay exactly xATR away from the real entry
+//  - qty sized so stop-out = exactly risk_pct of equity
+// ============================================================
+
+if buy_signal and strategy.position_size == 0
+    risk_dollars = strategy.equity * risk_pct
+    stop_dist    = stop_x * atr_val
+    qty          = risk_dollars / stop_dist
+    tp_ticks     = math.round(tp_x   * atr_val / syminfo.mintick)
+    sl_ticks     = math.round(stop_x * atr_val / syminfo.mintick)
+    strategy.entry("Long", strategy.long, qty=qty, comment="BUY")
+    strategy.exit("Exit", from_entry="Long", profit=tp_ticks, loss=sl_ticks, comment="TP/SL")
+
+// ============================================================
+//  SUPERTREND LINE
+// ============================================================
+
+st_col = st_bull ? color.new(color.lime, 15) : color.new(color.red, 15)
+plot(st_line, "Supertrend", color=st_col, linewidth=2)
+
+// ============================================================
+//  REGIME BACKGROUND
+// ============================================================
+
+bg_color = show_bg ? (btc_bull ? color.new(color.teal, 92) : color.new(color.maroon, 92)) : na
+bgcolor(bg_color, title="BTC Regime Background")
+
+// ============================================================
+//  SIGNAL MARKERS
+// ============================================================
+
+plotshape(buy_signal, "BUY Signal",
+     location=location.belowbar, style=shape.triangleup, size=size.normal,
+     color=color.new(color.lime, 0), text="BUY", textcolor=color.white)
+
+plotshape(show_flt and buy_filtered, "Filtered Out (BTC Bear)",
+     location=location.belowbar, style=shape.triangleup, size=size.small,
+     color=color.new(color.gray, 60), text="X", textcolor=color.new(color.white, 40))
+
+// ============================================================
+//  TP / SL VISUAL LINES  (approximate — based on signal close)
+//  The actual strategy exits at these same levels relative to
+//  the next-bar fill price, so lines are a close approximation
+// ============================================================
+
+if buy_signal
+    ep       = close
+    sl_lvl   = ep - stop_x * atr_val
+    tp_lvl   = ep + tp_x   * atr_val
+    rr       = (tp_lvl - ep) / math.max(ep - sl_lvl, 1e-9)
+    risk_show = (ep - sl_lvl) / ep * 100
+    ext      = bar_index + line_len
+
+    line.new(bar_index, ep,     ext, ep,     color=color.new(color.blue, 40), width=1, style=line.style_dotted)
+    line.new(bar_index, tp_lvl, ext, tp_lvl, color=color.new(color.lime, 20), width=2, style=line.style_dashed)
+    line.new(bar_index, sl_lvl, ext, sl_lvl, color=color.new(color.red,  20), width=2, style=line.style_dashed)
+
+    if show_box
+        box.new(bar_index, tp_lvl, ext, ep,     border_color=color.new(color.lime, 60), bgcolor=color.new(color.lime, 90))
+        box.new(bar_index, ep,     ext, sl_lvl, border_color=color.new(color.red,  60), bgcolor=color.new(color.red,  90))
+
+    tp_txt = "TP  +" + str.tostring(tp_x, "#.#") + "x ATR   " + str.tostring(tp_lvl, format.mintick)
+    sl_txt = "SL  -" + str.tostring(stop_x, "#.#") + "x ATR   " + str.tostring(sl_lvl, format.mintick)
+    en_txt = "ENTRY " + str.tostring(ep, format.mintick) + "   R:R=1:" + str.tostring(rr, "#.#") + "  Risk " + str.tostring(risk_show, "#.##") + "%"
+
+    label.new(ext, tp_lvl, tp_txt, color=color.new(color.lime, 15), textcolor=color.white, style=label.style_label_left,  size=size.small)
+    label.new(ext, sl_lvl, sl_txt, color=color.new(color.red,  15), textcolor=color.white, style=label.style_label_left,  size=size.small)
+    label.new(bar_index, ep, en_txt, color=color.new(color.blue, 15), textcolor=color.white, style=label.style_label_right, size=size.small)
+
+// ============================================================
+//  STATUS TEXT  (updated every bar)
+// ============================================================
+
+var string status_txt = "---"
+var color  status_col = color.gray
+
+if btc_bull and not st_bull
+    status_txt := "WATCHING"
+    status_col := color.new(color.orange, 20)
+else if btc_bull and st_bull
+    status_txt := "IN TREND"
+    status_col := color.new(color.teal, 20)
+else
+    status_txt := "WAIT - BTC Bear"
+    status_col := color.new(color.maroon, 30)
+
+// ============================================================
+//  STATUS TABLE
+// ============================================================
+
+if show_table and barstate.islast
+    var table tbl = table.new(position.top_right, 2, 8,
+         border_color=color.new(color.gray, 40), border_width=1,
+         frame_color=color.new(color.gray, 20), frame_width=1)
+
+    table.cell(tbl, 0, 0, "STRATEGY STATUS",
+         text_color=color.white, bgcolor=color.new(color.navy, 10),
+         text_size=size.normal, text_halign=text.align_center)
+    table.merge_cells(tbl, 0, 0, 1, 0)
+
+    reg_col = btc_bull ? color.new(color.teal, 20) : color.new(color.maroon, 30)
+    reg_txt = btc_bull ? "BULL" : "BEAR"
+    table.cell(tbl, 0, 1, "BTC Regime", text_color=color.white, bgcolor=color.new(color.gray, 60))
+    table.cell(tbl, 1, 1, reg_txt,      text_color=color.white, bgcolor=reg_col)
+
+    table.cell(tbl, 0, 2, "BTC EMA" + str.tostring(ema_fast), text_color=color.white, bgcolor=color.new(color.gray, 60))
+    table.cell(tbl, 1, 2, str.tostring(btc_ef_disp, format.mintick), text_color=color.white, bgcolor=color.new(color.gray, 60))
+    table.cell(tbl, 0, 3, "BTC EMA" + str.tostring(ema_slow), text_color=color.white, bgcolor=color.new(color.gray, 60))
+    table.cell(tbl, 1, 3, str.tostring(btc_es_disp, format.mintick), text_color=color.white, bgcolor=color.new(color.gray, 60))
+
+    st_col_now = st_bull ? color.new(color.lime, 20) : color.new(color.red, 20)
+    st_txt_now = st_bull ? "BULLISH" : "BEARISH"
+    table.cell(tbl, 0, 4, "Supertrend", text_color=color.white, bgcolor=color.new(color.gray, 60))
+    table.cell(tbl, 1, 4, st_txt_now,   text_color=color.white, bgcolor=st_col_now)
+
+    table.cell(tbl, 0, 5, "ATR(" + str.tostring(atr_len) + ")", text_color=color.white, bgcolor=color.new(color.gray, 60))
+    table.cell(tbl, 1, 5, str.tostring(atr_val, format.mintick),  text_color=color.white, bgcolor=color.new(color.gray, 60))
+
+    in_trade_txt = strategy.position_size > 0 ? "YES" : "NO"
+    in_trade_col = strategy.position_size > 0 ? color.new(color.lime, 20) : color.new(color.gray, 60)
+    table.cell(tbl, 0, 6, "In Trade?",    text_color=color.white, bgcolor=color.new(color.gray, 60))
+    table.cell(tbl, 1, 6, in_trade_txt,   text_color=color.white, bgcolor=in_trade_col)
+
+    table.cell(tbl, 0, 7, "Status",    text_color=color.white, bgcolor=color.new(color.gray, 60))
+    table.cell(tbl, 1, 7, status_txt,  text_color=color.white, bgcolor=status_col)
+
+// ============================================================
+//  ALERTS
+// ============================================================
+
+alertcondition(buy_signal,
+     title="BUY Signal (BTC Filtered)",
+     message="{{ticker}} - Supertrend BUY signal. BTC regime is BULLISH. Entry near {{close}}")
+
+alertcondition(buy_filtered,
+     title="BUY Signal FILTERED (BTC Bearish)",
+     message="{{ticker}} - Supertrend flipped bullish BUT BTC is bearish. Signal skipped.")
+
+alertcondition(st_turned_bear,
+     title="Supertrend Turned Bearish",
+     message="{{ticker}} - Supertrend flipped BEARISH. Consider exiting open position.")

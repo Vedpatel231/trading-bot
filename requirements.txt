@@ -1,7 +1,5 @@
 ccxt
+numpy
 pandas
 ta
 requests
-alpaca-trade-api==3.2.0
-yfinance
- 
