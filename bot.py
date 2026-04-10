@@ -207,12 +207,13 @@ def compute_supertrend(df, period=10, multiplier=3.0):
 
 
 def get_btc_bull():
-    """True when BTC daily EMA20 > EMA50 (regime is bullish)."""
+    """True when BTC daily EMA20 > EMA50 on the last COMPLETED candle."""
     try:
         df    = fetch_ohlcv(BTC_SYMBOL, TIMEFRAME, 200)
         ema_f = ta.trend.ema_indicator(df["close"], window=EMA_FAST)
         ema_s = ta.trend.ema_indicator(df["close"], window=EMA_SLOW)
-        return bool(safe_float(ema_f.iloc[-1]) > safe_float(ema_s.iloc[-1]))
+        # Use iloc[-2] (last completed bar) — iloc[-1] is the forming candle
+        return bool(safe_float(ema_f.iloc[-2]) > safe_float(ema_s.iloc[-2]))
     except Exception:
         return True   # fail-safe: allow trading if BTC data unavailable
 
@@ -429,6 +430,9 @@ def run_bot():
                 coin = symbol.split("/")[0]
                 try:
                     df   = fetch_ohlcv(symbol, TIMEFRAME, 200)
+                    if len(df) < 4:
+                        print(f"  {coin}: insufficient data ({len(df)} bars) — skipping")
+                        continue
                     atr  = ta.volatility.average_true_range(
                         df["high"], df["low"], df["close"], window=ATR_PERIOD
                     )
