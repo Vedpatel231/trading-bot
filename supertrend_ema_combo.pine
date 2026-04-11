@@ -1,0 +1,156 @@
+//@version=6
+strategy("Supertrend + EMA Combo",
+     overlay              = true,
+     initial_capital      = 1000,
+     default_qty_type     = strategy.percent_of_equity,
+     default_qty_value    = 10,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.1,
+     pyramiding           = 0)
+
+// ═══════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════
+var G1 = "── Supertrend ──"
+st_period = input.int(10,   "ATR Period",   minval=1, group=G1)
+st_mult   = input.float(3.0,"Multiplier",   step=0.1, group=G1)
+
+var G2 = "── EMA Confirmation ──"
+ema_fast_len = input.int(9,  "Fast EMA", minval=1, group=G2)
+ema_slow_len = input.int(18, "Slow EMA", minval=1, group=G2)
+ema_exit     = input.bool(true, "Also Exit on EMA Cross Down", group=G2)
+
+var G3 = "── RSI Filter ──"
+use_rsi = input.bool(true, "Enable RSI Filter",   group=G3)
+rsi_len = input.int(14,    "RSI Period",           group=G3)
+rsi_max = input.int(70,    "Max RSI at Entry",     group=G3)
+
+var G4 = "── ATR Stop Loss ──"
+sl_mult = input.float(2.0, "Stop Loss (× ATR)", step=0.5, group=G4)
+atr_len = input.int(14,    "ATR Period",                  group=G4)
+
+var G5 = "── BTC Regime Filter ──"
+use_btc  = input.bool(false, "Only Trade in BTC Bull Market",  group=G5)
+btc_fast = input.int(20,     "BTC EMA Fast",                  group=G5)
+btc_slow = input.int(50,     "BTC EMA Slow",                  group=G5)
+
+var G6 = "── Date Range ──"
+use_dates = input.bool(false,                          "Enable Date Filter", group=G6)
+dt_start  = input.time(timestamp("2020-01-01 00:00"), "Start Date",         group=G6)
+dt_end    = input.time(timestamp("2030-12-31 00:00"), "End Date",           group=G6)
+
+// ═══════════════════════════════════════════════════════
+//  SUPERTREND
+// ═══════════════════════════════════════════════════════
+atr_st = ta.atr(st_period)
+hl2    = (high + low) / 2
+
+raw_upper = hl2 + st_mult * atr_st
+raw_lower = hl2 - st_mult * atr_st
+
+var float f_upper = na
+var float f_lower = na
+var int   st_dir  = 1
+
+f_upper := na(f_upper[1]) ? raw_upper :
+           (raw_upper < f_upper[1] or close[1] > f_upper[1]) ? raw_upper : f_upper[1]
+f_lower := na(f_lower[1]) ? raw_lower :
+           (raw_lower > f_lower[1] or close[1] < f_lower[1]) ? raw_lower : f_lower[1]
+
+st_dir := close > nz(f_upper[1], raw_upper) ?  1 :
+          close < nz(f_lower[1], raw_lower) ? -1 : nz(st_dir[1], 1)
+
+st_turned_bull = st_dir ==  1 and st_dir[1] == -1
+st_turned_bear = st_dir == -1 and st_dir[1] ==  1
+st_line        = st_dir ==  1 ? f_lower : f_upper
+
+// ═══════════════════════════════════════════════════════
+//  EMA
+// ═══════════════════════════════════════════════════════
+ema_f      = ta.ema(close, ema_fast_len)
+ema_s      = ta.ema(close, ema_slow_len)
+ema_bull   = ema_f > ema_s
+ema_x_down = ta.crossunder(ema_f, ema_s)
+
+// ═══════════════════════════════════════════════════════
+//  RSI + ATR
+// ═══════════════════════════════════════════════════════
+rsi    = ta.rsi(close, rsi_len)
+atr_sl = ta.atr(atr_len)
+rsi_ok = not use_rsi or rsi < rsi_max
+
+// ═══════════════════════════════════════════════════════
+//  BTC REGIME (works on any chart)
+// ═══════════════════════════════════════════════════════
+btc_close = request.security("BINANCE:BTCUSDT", timeframe.period, close)
+btc_ef    = ta.ema(btc_close, btc_fast)
+btc_es    = ta.ema(btc_close, btc_slow)
+btc_bull  = not use_btc or btc_ef > btc_es
+
+// ═══════════════════════════════════════════════════════
+//  ENTRY / EXIT CONDITIONS
+// ═══════════════════════════════════════════════════════
+in_date = not use_dates or (time >= dt_start and time <= dt_end)
+
+// ENTRY  — Supertrend just flipped bullish AND EMA already bullish
+//          This avoids entering right after an EMA cross in choppy markets
+entry_signal = st_turned_bull and ema_bull and rsi_ok and btc_bull and in_date
+
+// EXIT   — Supertrend flips bearish (primary), optional EMA cross down
+exit_signal  = st_turned_bear or (ema_exit and ema_x_down)
+
+// ═══════════════════════════════════════════════════════
+//  ORDERS
+// ═══════════════════════════════════════════════════════
+var float sl_price = na
+
+if entry_signal and strategy.position_size == 0
+    sl_price := close - sl_mult * atr_sl
+    strategy.entry("Long", strategy.long, comment="ST↑+EMA↑")
+
+if strategy.position_size > 0
+    strategy.exit("SL", "Long", stop=sl_price)
+    if exit_signal
+        strategy.close("Long", comment="Exit")
+
+// ═══════════════════════════════════════════════════════
+//  VISUALS
+// ═══════════════════════════════════════════════════════
+
+// Supertrend line (green support / red resistance)
+plot(st_line, "Supertrend",
+     color     = st_dir == 1 ? color.new(color.green, 0) : color.new(color.red, 0),
+     linewidth = 2,
+     style     = plot.style_linebr)
+
+// EMA lines
+plot(ema_f, "EMA Fast", color.new(color.blue,   20), linewidth=1)
+plot(ema_s, "EMA Slow", color.new(color.orange, 20), linewidth=2)
+
+// Fill between EMAs
+ema_fill_col = ema_bull ? color.new(color.green, 88) : color.new(color.red, 88)
+fill(plot(ema_f, display=display.none), plot(ema_s, display=display.none),
+     color=ema_fill_col, title="EMA Cloud")
+
+// Entry / exit markers
+plotshape(entry_signal,
+          title    = "Buy",
+          style    = shape.triangleup,
+          location = location.belowbar,
+          color    = color.lime,
+          size     = size.normal)
+
+plotshape(exit_signal and strategy.position_size[1] > 0,
+          title    = "Sell",
+          style    = shape.triangledown,
+          location = location.abovebar,
+          color    = color.red,
+          size     = size.normal)
+
+// Live SL line
+plot(strategy.position_size > 0 ? sl_price : na,
+     "Stop Loss", color.new(color.red, 0), 1, plot.style_linebr)
+
+// Background: teal = both signals bullish, no color = mixed/bearish
+bgcolor(st_dir == 1 and ema_bull ? color.new(color.teal, 93) : na,
+        title = "Both Signals Bullish")

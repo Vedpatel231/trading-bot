@@ -1,0 +1,53 @@
+//@version=6
+strategy("EMA Crossover Bot",
+         overlay              = true,
+         initial_capital      = 1000,
+         default_qty_type     = strategy.percent_of_equity,
+         default_qty_value    = 10,
+         commission_type      = strategy.commission.percent,
+         commission_value     = 0.1)
+
+// ── Inputs ────────────────────────────────────────────
+sl_mult = input.float(2.0, "Stop Loss (× ATR)", step=0.5, group="ATR Risk Management")
+atr_len = input.int(14,    "ATR Period",                   group="ATR Risk Management")
+
+use_dates  = input.bool(false,                          "Enable Date Filter", group="Date Range")
+dt_start   = input.time(timestamp("2020-01-01 00:00"), "Start Date",         group="Date Range")
+dt_end     = input.time(timestamp("2030-12-31 00:00"), "End Date",           group="Date Range")
+
+// ── Indicators ────────────────────────────────────────
+fast = ta.ema(close, 9)
+slow = ta.ema(close, 18)
+rsi  = ta.rsi(close, 14)
+atr  = ta.atr(atr_len)
+
+// ── Signals ───────────────────────────────────────────
+in_date    = not use_dates or (time >= dt_start and time <= dt_end)
+buySignal  = ta.crossover(fast, slow)  and rsi < 70 and in_date
+sellSignal = ta.crossunder(fast, slow) and rsi > 30
+
+// ── Orders ────────────────────────────────────────────
+var float sl_price = na
+
+if buySignal and strategy.position_size == 0
+    sl_price := close - sl_mult * atr
+    strategy.entry("Long", strategy.long)
+
+if strategy.position_size > 0
+    strategy.exit("SL", "Long", stop=sl_price)
+    if sellSignal
+        strategy.close("Long", comment="EMA↓")
+
+// ── Visuals ───────────────────────────────────────────
+plot(fast, "Fast EMA 9",  color=color.green, linewidth=2)
+plot(slow, "Slow EMA 18", color=color.red,   linewidth=2)
+
+plotshape(buySignal,  title="Buy",  style=shape.triangleup,
+          location=location.belowbar, color=color.lime, size=size.small, text="BUY")
+plotshape(sellSignal and strategy.position_size[1] > 0,
+          title="Sell", style=shape.triangledown,
+          location=location.abovebar, color=color.red,  size=size.small, text="SELL")
+
+// Live SL line while in a trade
+plot(strategy.position_size > 0 ? sl_price : na,
+     "Stop Loss", color=color.new(color.red, 0), linewidth=1, style=plot.style_linebr)

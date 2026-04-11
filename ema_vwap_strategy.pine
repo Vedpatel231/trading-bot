@@ -1,0 +1,143 @@
+//@version=6
+strategy("EMA 9/21 + VWAP + ATR Stops",
+     overlay                = true,
+     initial_capital        = 1000,
+     default_qty_type       = strategy.percent_of_equity,
+     default_qty_value      = 10,
+     commission_type        = strategy.commission.percent,
+     commission_value       = 0.1,
+     pyramiding             = 0)
+
+// ═══════════════════════════════════════════════════════
+//  INPUTS
+// ═══════════════════════════════════════════════════════
+var G1 = "── EMA Settings ──"
+fast_len  = input.int(9,  "Fast EMA Period", minval=1, group=G1)
+slow_len  = input.int(21, "Slow EMA Period", minval=1, group=G1)
+ema_src   = input.string("Close", "EMA Source", options=["Close","High/Low Channel"], group=G1)
+
+var G2 = "── VWAP Filter ──"
+vwap_anchor    = input.string("Month", "VWAP Anchor Period",
+                               options=["Week","Month","Quarter","Year"], group=G2)
+use_vwap_entry = input.bool(false, "Only Enter When Price > VWAP",     group=G2)
+use_vwap_exit  = input.bool(false, "Exit When Price Drops Below VWAP", group=G2)
+
+var G3 = "── RSI Filter ──"
+use_rsi = input.bool(true,  "Enable RSI Filter",  group=G3)
+rsi_len = input.int(14,    "RSI Period",          group=G3)
+rsi_max = input.int(70,    "Max RSI at Entry",    group=G3)
+
+var G4 = "── ATR Risk Management ──"
+use_stops = input.bool(true,  "Use ATR Stop Loss & Take Profit", group=G4)
+atr_len   = input.int(14,    "ATR Period",                      group=G4)
+sl_mult   = input.float(2.0, "Stop Loss (× ATR)",  step=0.5,   group=G4)
+tp_mult   = input.float(5.0, "Take Profit (× ATR)", step=0.5,  group=G4)
+
+var G5 = "── Volume Confirmation ──"
+use_vol    = input.bool(false, "Require Above-Average Volume", group=G5)
+vol_ma_len = input.int(20,    "Volume MA Period",              group=G5)
+
+var G6 = "── Date Range ──"
+use_dates = input.bool(false,                          "Enable Date Filter", group=G6)
+dt_start  = input.time(timestamp("2020-01-01 00:00"), "Start Date",         group=G6)
+dt_end    = input.time(timestamp("2030-12-31 00:00"), "End Date",           group=G6)
+
+// ═══════════════════════════════════════════════════════
+//  INDICATORS
+// ═══════════════════════════════════════════════════════
+
+// EMA — standard (close) or High/Low channel mode
+ema_fast = ema_src == "High/Low Channel" ? ta.ema(high, fast_len) : ta.ema(close, fast_len)
+ema_slow = ema_src == "High/Low Channel" ? ta.ema(low,  slow_len) : ta.ema(close, slow_len)
+
+rsi = ta.rsi(close, rsi_len)
+atr = ta.atr(atr_len)
+
+// VWAP with selectable anchor
+vwap_reset = vwap_anchor == "Week"    ? timeframe.change("W") :
+             vwap_anchor == "Month"   ? timeframe.change("M") :
+             vwap_anchor == "Quarter" ? (month % 3 == 1 and timeframe.change("M")) :
+             timeframe.change("Y")
+
+[vwap_val, _, _] = ta.vwap(hlc3, vwap_reset, 1)
+
+// Volume MA
+vol_ma = ta.sma(volume, vol_ma_len)
+
+// ═══════════════════════════════════════════════════════
+//  CONDITIONS
+// ═══════════════════════════════════════════════════════
+in_date    = not use_dates     or (time >= dt_start and time <= dt_end)
+above_vwap = not use_vwap_entry or (na(vwap_val) ? true : close > vwap_val)
+rsi_ok     = not use_rsi       or rsi < rsi_max
+good_vol   = not use_vol       or volume > vol_ma
+
+ema_cross_up   = ta.crossover(ema_fast,  ema_slow)
+ema_cross_down = ta.crossunder(ema_fast, ema_slow)
+
+entry_ok = above_vwap and rsi_ok and good_vol and in_date
+
+// ═══════════════════════════════════════════════════════
+//  STRATEGY LOGIC
+// ═══════════════════════════════════════════════════════
+var float sl_price = na
+var float tp_price = na
+
+// ENTRY — EMA crossover + all filters pass
+if ema_cross_up and entry_ok and strategy.position_size == 0
+    sl_price := close - sl_mult * atr
+    tp_price := close + tp_mult * atr
+    strategy.entry("Long", strategy.long, comment="EMA↑")
+
+// EXIT
+if strategy.position_size > 0
+    // ATR stop loss + take profit (OCO order)
+    if use_stops
+        strategy.exit("SL/TP", "Long", stop=sl_price, limit=tp_price)
+    // EMA crossunder always closes the trade
+    if ema_cross_down
+        strategy.close("Long", comment="EMA↓")
+    // Optional: close when price falls below VWAP
+    if use_vwap_exit and not na(vwap_val) and close < vwap_val
+        strategy.close("Long", comment="<VWAP")
+
+// ═══════════════════════════════════════════════════════
+//  VISUALS
+// ═══════════════════════════════════════════════════════
+
+// EMA lines
+fast_color = ema_src == "High/Low Channel" ? color.new(color.green, 20) : color.new(color.blue, 0)
+slow_color = ema_src == "High/Low Channel" ? color.new(color.red,   20) : color.new(color.orange, 0)
+fast_label = ema_src == "High/Low Channel" ? "EMA Fast (High)" : "EMA Fast"
+slow_label = ema_src == "High/Low Channel" ? "EMA Slow (Low)"  : "EMA Slow"
+
+plot(ema_fast, fast_label, fast_color, linewidth=1)
+plot(ema_slow, slow_label, slow_color, linewidth=2)
+
+// Fill between EMAs
+ema_bull = ema_fast > ema_slow
+fill(plot(ema_fast, display=display.none), plot(ema_slow, display=display.none),
+     color = ema_bull ? color.new(color.green, 88) : color.new(color.red, 88),
+     title = "EMA Cloud")
+
+// VWAP
+plot(vwap_val, "VWAP", color.new(color.purple, 0), linewidth=1, style=plot.style_stepline)
+
+// Buy / Sell markers
+plotshape(ema_cross_up and entry_ok,
+          title="Buy",  style=shape.triangleup,
+          location=location.belowbar, color=color.lime, size=size.normal)
+
+plotshape(ema_cross_down and strategy.position_size[1] > 0,
+          title="Sell", style=shape.triangledown,
+          location=location.abovebar, color=color.red,  size=size.normal)
+
+// Live SL / TP lines
+plot(strategy.position_size > 0 and use_stops ? sl_price : na,
+     "Stop Loss",   color.new(color.red,   0), 1, plot.style_linebr)
+plot(strategy.position_size > 0 and use_stops ? tp_price : na,
+     "Take Profit", color.new(color.green, 0), 1, plot.style_linebr)
+
+// VWAP background
+bgcolor(use_vwap_entry and not na(vwap_val) and close > vwap_val ? color.new(color.teal, 93) : na,
+        title="Above VWAP")

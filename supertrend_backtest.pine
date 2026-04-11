@@ -1,0 +1,132 @@
+//@version=6
+// ─────────────────────────────────────────────────────────
+//  Daily Supertrend Strategy — mirrors bot.py exactly
+//  Run on: BTCUSDT / ETHUSDT / SOLUSDT  (Daily chart)
+//  Set initial capital to $333.33 per coin ($1,000 / 3)
+// ─────────────────────────────────────────────────────────
+strategy("Daily Supertrend (bot.py)",
+     overlay              = true,
+     initial_capital      = 333,
+     default_qty_type     = strategy.cash,
+     default_qty_value    = 333,
+     commission_type      = strategy.commission.percent,
+     commission_value     = 0.1,
+     pyramiding           = 0)
+
+// ═══════════════════════════════════════════════════════
+//  INPUTS  — match bot.py defaults exactly
+// ═══════════════════════════════════════════════════════
+var G1 = "── Supertrend ──"
+st_period = input.int(10,   "ATR Period",   group=G1)
+st_mult   = input.float(3.0,"Multiplier",   group=G1)
+
+var G2 = "── ATR Position Sizing ──"
+risk_pct = input.float(4.0, "Risk per Trade (%)", step=0.5, group=G2)
+sl_atr   = input.float(2.0, "Stop Loss (× ATR)",  step=0.5, group=G2)
+tp_atr   = input.float(5.0, "Take Profit (× ATR)", step=0.5, group=G2)
+atr_len  = input.int(14,    "ATR Period",           group=G2)
+
+var G3 = "── BTC Regime Filter ──"
+use_btc_filter = input.bool(true,  "Enable BTC Bull Filter (EMA 20/50)", group=G3)
+btc_ema_fast   = input.int(20,     "BTC EMA Fast", group=G3)
+btc_ema_slow   = input.int(50,     "BTC EMA Slow", group=G3)
+
+var G4 = "── Date Range ──"
+use_dates = input.bool(true,                           "Enable Date Filter", group=G4)
+dt_start  = input.time(timestamp("2020-01-01 00:00"), "Start Date",         group=G4)
+dt_end    = input.time(timestamp("2026-04-10 00:00"), "End Date",           group=G4)
+
+// ═══════════════════════════════════════════════════════
+//  SUPERTREND  (same logic as compute_supertrend in bot.py)
+// ═══════════════════════════════════════════════════════
+atr_st   = ta.atr(st_period)
+hl2      = (high + low) / 2
+
+raw_upper = hl2 + st_mult * atr_st
+raw_lower = hl2 - st_mult * atr_st
+
+var float f_upper = na
+var float f_lower = na
+var int   st_dir  = 1
+
+f_upper := na(f_upper[1]) ? raw_upper :
+           (raw_upper < f_upper[1] or close[1] > f_upper[1]) ? raw_upper : f_upper[1]
+f_lower := na(f_lower[1]) ? raw_lower :
+           (raw_lower > f_lower[1] or close[1] < f_lower[1]) ? raw_lower : f_lower[1]
+
+st_dir := close > nz(f_upper[1], raw_upper) ?  1 :
+          close < nz(f_lower[1], raw_lower) ? -1 : nz(st_dir[1], 1)
+
+st_turned_bull = st_dir ==  1 and st_dir[1] == -1
+st_turned_bear = st_dir == -1 and st_dir[1] ==  1
+st_line        = st_dir ==  1 ? f_lower : f_upper
+
+// ═══════════════════════════════════════════════════════
+//  ATR FOR POSITION SIZING
+// ═══════════════════════════════════════════════════════
+atr = ta.atr(atr_len)
+
+// ═══════════════════════════════════════════════════════
+//  BTC REGIME FILTER  (get_btc_bull in bot.py)
+// ═══════════════════════════════════════════════════════
+btc_close = request.security("BINANCE:BTCUSDT", "D", close)
+btc_ef    = ta.ema(btc_close, btc_ema_fast)
+btc_es    = ta.ema(btc_close, btc_ema_slow)
+btc_bull  = not use_btc_filter or btc_ef > btc_es
+
+// ═══════════════════════════════════════════════════════
+//  DATE FILTER
+// ═══════════════════════════════════════════════════════
+in_date = not use_dates or (time >= dt_start and time <= dt_end)
+
+// ═══════════════════════════════════════════════════════
+//  ENTRY / EXIT LOGIC  (matches open_trade / close_trade)
+// ═══════════════════════════════════════════════════════
+var float sl_price = na
+var float tp_price = na
+
+// ENTRY — Supertrend flips bull + BTC regime is bullish
+if st_turned_bull and btc_bull and in_date and strategy.position_size == 0
+    // ATR position sizing: qty = (equity × risk%) / (sl_atr × atr)
+    risk_amount = strategy.equity * (risk_pct / 100)
+    sl_distance = sl_atr * atr
+    qty         = risk_amount / sl_distance
+
+    sl_price := close - sl_distance
+    tp_price := close + tp_atr * atr
+
+    strategy.entry("Long", strategy.long, qty=qty, comment="ST↑")
+
+// EXIT — Supertrend flips bear → close trade (matches check_exits in bot.py)
+if strategy.position_size > 0
+    strategy.exit("SL/TP", "Long", stop=sl_price, limit=tp_price)
+    if st_turned_bear
+        strategy.close("Long", comment="ST↓")
+
+// ═══════════════════════════════════════════════════════
+//  VISUALS
+// ═══════════════════════════════════════════════════════
+
+// Supertrend line
+plot(st_line, "Supertrend",
+     color     = st_dir == 1 ? color.new(color.green, 0) : color.new(color.red, 0),
+     linewidth = 2,
+     style     = plot.style_linebr)
+
+// BTC regime background — grey out when BTC is bearish
+bgcolor(not btc_bull ? color.new(color.gray, 92) : na, title="BTC Bear (filtered)")
+
+// Entry / exit markers
+plotshape(st_turned_bull and btc_bull and in_date,
+          title="Buy",  style=shape.triangleup,
+          location=location.belowbar, color=color.lime, size=size.normal)
+
+plotshape(st_turned_bear and strategy.position_size[1] > 0,
+          title="Sell", style=shape.triangledown,
+          location=location.abovebar, color=color.red, size=size.normal)
+
+// Live SL / TP lines
+plot(strategy.position_size > 0 ? sl_price : na,
+     "Stop Loss",   color.new(color.red,   0), 1, plot.style_linebr)
+plot(strategy.position_size > 0 ? tp_price : na,
+     "Take Profit", color.new(color.green, 0), 1, plot.style_linebr)
