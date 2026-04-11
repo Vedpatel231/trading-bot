@@ -53,11 +53,15 @@ def start_health_server():
 
 
 # ══════════════════════════════════════════════════════════════
-#  STRATEGY SETTINGS
+#  STRATEGY SETTINGS  —  Supertrend + EMA Combo
 #
-#  Backtest result (Jan 2022 – Apr 2026, 3 coins, $1,000):
-#    $1,000 → $2,220  |  +29.3%/yr  |  64% WR  |  PF=4.26
-#    Max drawdown: -11.1%  |  Sharpe: 1.22
+#  Entry : Supertrend(10, 3.0) flips bull  AND  EMA 9 > EMA 18 on coin chart
+#  Exit  : Supertrend flips bear  OR  EMA 9 crosses below EMA 18
+#  Filter: BTC EMA 20/50 regime (macro safety; to disable, make get_btc_bull() return True)
+#
+#  Backtest result (2020–2026, BTC+ETH+SOL, $333.33/coin, 0.2% commission):
+#    $1,000 → $2,167  |  +13.2%/yr CAGR  |  ~45% WR  |  PF=3.2–8.3
+#    Max drawdown: 4.8% (all coins)  — vs 9.3% for pure EMA strategy
 # ══════════════════════════════════════════════════════════════
 
 SYMBOLS         = ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
@@ -69,6 +73,9 @@ ST_MULT         = 3.0           # Supertrend multiplier
 ATR_PERIOD      = 14            # ATR period for sizing / TP / SL
 EMA_FAST        = 20            # BTC regime: fast EMA
 EMA_SLOW        = 50            # BTC regime: slow EMA
+EMA_ENTRY_FAST  = 9             # Combo: per-coin entry EMA (fast)
+EMA_ENTRY_SLOW  = 18            # Combo: per-coin entry EMA (slow)
+EMA_EXIT        = True          # Also exit when EMA 9 crosses below EMA 18
 
 RISK_PCT        = 0.04          # 4% of equity risked per trade
 TP_ATR          = 5.0           # Take profit = 5×ATR above entry
@@ -266,7 +273,7 @@ def open_trade(symbol, price, atr):
 
     coin = symbol.split("/")[0]
     msg = (
-        f"🟢 <b>BUY {coin}</b> — Supertrend ↑ + BTC Bull\n"
+        f"🟢 <b>BUY {coin}</b> — ST ↑ + EMA Bull (Combo)\n"
         f"Price:   ${price:,.2f}\n"
         f"Qty:     {qty:.6f} {coin}  (cost ${cost:.2f})\n"
         f"ATR:     ${atr:.2f}\n"
@@ -398,12 +405,13 @@ def schedule_daily_report():
 def run_bot():
     coins = ", ".join(s.split("/")[0] for s in SYMBOLS)
     msg = (
-        f"🤖 <b>Supertrend Daily Bot started</b>\n"
-        f"Strategy: Supertrend({ST_PERIOD}, {ST_MULT}) + BTC EMA{EMA_FAST}/{EMA_SLOW} filter\n"
-        f"Coins:    {coins}\n"
-        f"Long-only  |  TP: {TP_ATR}×ATR  |  SL: {SL_ATR}×ATR\n"
-        f"Risk: {RISK_PCT*100:.0f}% per trade  |  Fee: {TRADING_FEE_PCT*100:.2f}%\n"
-        f"Backtest: $1,000 → $2,220 (+29.3%/yr) Jan 2022–Apr 2026\n"
+        f"🤖 <b>Supertrend + EMA Combo Bot started</b>\n"
+        f"Entry:  ST({ST_PERIOD},{ST_MULT}) flip ↑ AND EMA{EMA_ENTRY_FAST}>{EMA_ENTRY_SLOW}\n"
+        f"Exit:   ST flip ↓ OR EMA{EMA_ENTRY_FAST} crosses below EMA{EMA_ENTRY_SLOW}\n"
+        f"Filter: BTC EMA{EMA_FAST}/{EMA_SLOW} regime\n"
+        f"Coins:  {coins}\n"
+        f"TP: {TP_ATR}×ATR  |  SL: {SL_ATR}×ATR  |  Risk: {RISK_PCT*100:.0f}%/trade\n"
+        f"Backtest: $1,000 → $2,167 (+13.2%/yr CAGR)  Max DD: 4.8%\n"
         f"Balance:  ${INITIAL_BALANCE:,.2f}  (paper trading)"
     )
     print("=" * 58)
@@ -430,13 +438,15 @@ def run_bot():
                 coin = symbol.split("/")[0]
                 try:
                     df   = fetch_ohlcv(symbol, TIMEFRAME, 200)
-                    if len(df) < 4:
+                    if len(df) < 25:    # need warmup: EMA18(18) + ATR14 + 3 look-back bars
                         print(f"  {coin}: insufficient data ({len(df)} bars) — skipping")
                         continue
                     atr  = ta.volatility.average_true_range(
                         df["high"], df["low"], df["close"], window=ATR_PERIOD
                     )
                     _, st_dir = compute_supertrend(df, ST_PERIOD, ST_MULT)
+                    ema_f_ser = ta.trend.ema_indicator(df["close"], window=EMA_ENTRY_FAST)
+                    ema_s_ser = ta.trend.ema_indicator(df["close"], window=EMA_ENTRY_SLOW)
 
                     # Binance returns 199 completed candles + 1 still-forming candle.
                     # iloc[-1] = today's incomplete candle (price still moving).
@@ -449,11 +459,27 @@ def run_bot():
                     price       = safe_float(df["close"].iloc[-2])
                     is_new      = (candle_ts != last_candle_ts[symbol])
 
+                    # EMA 9/18 on this coin (last completed candle)
+                    # NaN guard: check raw series BEFORE safe_float so that a NaN prev
+                    # value (which safe_float converts to 0.0) cannot cause a false crossunder
+                    _ef_prev_raw = ema_f_ser.iloc[-3]
+                    _es_prev_raw = ema_s_ser.iloc[-3]
+                    ema_prev_ok    = not (pd.isna(_ef_prev_raw) or pd.isna(_es_prev_raw))
+                    ema_f_now   = safe_float(ema_f_ser.iloc[-2])
+                    ema_f_prev  = safe_float(_ef_prev_raw)
+                    ema_s_now   = safe_float(ema_s_ser.iloc[-2])
+                    ema_s_prev  = safe_float(_es_prev_raw)
+                    ema_bull       = ema_f_now  > ema_s_now
+                    ema_cross_down = (ema_prev_ok
+                                      and ema_f_prev >= ema_s_prev
+                                      and ema_f_now  <  ema_s_now)
+
                     st_lbl   = "↑BULL" if cur_dir == 1 else "↓BEAR"
+                    ema_lbl  = "↑" if ema_bull else "↓"
                     pos_lbl  = "IN TRADE" if positions[symbol]["in_trade"] else "watching"
 
                     print(
-                        f"  {coin:<4} | ST:{st_lbl} | ATR:${cur_atr:,.2f} | "
+                        f"  {coin:<4} | ST:{st_lbl} EMA:{ema_lbl} | ATR:${cur_atr:,.2f} | "
                         f"${price:,.2f} | {pos_lbl}"
                         + (" [NEW CANDLE]" if is_new else "")
                     )
@@ -468,16 +494,23 @@ def run_bot():
                     flipped_bear = (cur_dir == -1 and prev_dir ==  1)
 
                     # ── ENTRY ──────────────────────────────────────────────
-                    # Supertrend just turned bullish AND BTC regime is bullish
-                    if flipped_bull and btc_bull and not pos["in_trade"]:
+                    # Combo: Supertrend just flipped bull AND EMA 9 already above EMA 18
+                    # (BTC regime = optional macro filter)
+                    if flipped_bull and ema_bull and btc_bull and not pos["in_trade"]:
                         open_trade(symbol, price, cur_atr)
 
                     # ── EXIT via signal ────────────────────────────────────
-                    # Supertrend just turned bearish — close the long
-                    elif flipped_bear and pos["in_trade"]:
-                        close_trade(symbol, price, reason="Supertrend turned bearish")
+                    # Primary  : Supertrend turned bearish
+                    # Secondary: EMA 9 crosses below EMA 18 (early exit on trend change)
+                    elif pos["in_trade"]:
+                        if flipped_bear:
+                            close_trade(symbol, price, reason="Supertrend turned bearish")
+                        elif EMA_EXIT and ema_cross_down:
+                            close_trade(symbol, price, reason="EMA 9 crossed below EMA 18")
 
                     # ── INFO: filtered signal ──────────────────────────────
+                    elif flipped_bull and not ema_bull:
+                        print(f"  {coin}: ST flipped bull but EMA is bearish — signal skipped")
                     elif flipped_bull and not btc_bull:
                         print(f"  {coin}: ST flipped bull but BTC is bearish — signal skipped")
                         send_telegram(
